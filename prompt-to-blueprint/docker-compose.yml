@@ -1,0 +1,77 @@
+version: "3.9"
+
+services:
+  # --- React Frontend ---
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # --- FastAPI Backend ---
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=qwen2.5:1.5b
+      - FRONTEND_URL=http://localhost:3000
+      - GNN_MODEL_PATH=models/floorplan_gnn.pt
+    volumes:
+      - model-data:/app/models
+    depends_on:
+      - redis
+      - ollama
+    restart: unless-stopped
+
+  # --- RQ Worker ---
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python -m rq.cli worker layout --url redis://redis:6379/0
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=qwen2.5:1.5b
+      - GNN_MODEL_PATH=models/floorplan_gnn.pt
+    volumes:
+      - model-data:/app/models
+    depends_on:
+      - redis
+      - ollama
+    restart: unless-stopped
+
+  # --- Redis ---
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  # --- Ollama (Local LLM) ---
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  model-data:
+  redis-data:
+  ollama-data:
