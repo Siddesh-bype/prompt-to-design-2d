@@ -26,6 +26,54 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Defaults for auto-repair when the LLM output is incomplete or inconsistent.
+ROOM_DEFAULT_AREA = {
+    RoomType.LIVING_ROOM: 24.0,
+    RoomType.MASTER_BEDROOM: 20.0,
+    RoomType.BEDROOM: 14.0,
+    RoomType.KITCHEN: 10.0,
+    RoomType.BATHROOM: 5.0,
+    RoomType.TOILET: 4.5,
+    RoomType.CORRIDOR: 5.0,
+    RoomType.BALCONY: 6.0,
+    RoomType.STUDY: 8.0,
+    RoomType.DINING: 10.0,
+    RoomType.UTILITY: 5.0,
+    RoomType.GARAGE: 18.0,
+}
+
+BHK_TARGETS = {
+    1: {
+        RoomType.BEDROOM: 1,
+        RoomType.LIVING_ROOM: 1,
+        RoomType.KITCHEN: 1,
+        RoomType.BATHROOM: 1,
+    },
+    2: {
+        RoomType.MASTER_BEDROOM: 1,
+        RoomType.BEDROOM: 1,
+        RoomType.LIVING_ROOM: 1,
+        RoomType.KITCHEN: 1,
+        RoomType.BATHROOM: 2,
+        RoomType.CORRIDOR: 1,
+    },
+    3: {
+        RoomType.MASTER_BEDROOM: 1,
+        RoomType.BEDROOM: 2,
+        RoomType.LIVING_ROOM: 1,
+        RoomType.KITCHEN: 1,
+        RoomType.BATHROOM: 3,
+        RoomType.CORRIDOR: 1,
+    },
+    4: {
+        RoomType.MASTER_BEDROOM: 1,
+        RoomType.BEDROOM: 3,
+        RoomType.LIVING_ROOM: 1,
+        RoomType.KITCHEN: 1,
+        RoomType.BATHROOM: 4,
+        RoomType.CORRIDOR: 1,
+    },
+}
 
 # ─── Error Classes ───────────────────────────────────────────────────────────
 
@@ -63,7 +111,7 @@ RULES:
       "room_id": "room_1",
       "room_type": "<ROOM_TYPE>",
       "target_area_sqm": <float 4.0-80.0>,
-      "compass_preference": "<NORTH|SOUTH|EAST|WEST|null>"  // ONLY cardinal directions, never NE/SW/etc,
+      "compass_preference": "<NORTH|SOUTH|EAST|WEST|null>",
       "label": "<optional string or null>"
     }
   ],
@@ -82,13 +130,14 @@ RULES:
 }
 
 ROOM_TYPE values: LIVING_ROOM, MASTER_BEDROOM, BEDROOM, KITCHEN, BATHROOM, TOILET, CORRIDOR, BALCONY, STUDY, DINING, UTILITY, GARAGE
+compass_preference: ONLY cardinal directions (NORTH, SOUTH, EAST, WEST). NEVER use NE, NW, SE, SW, NORTHEAST, etc.
 
 INDIAN TERMINOLOGY MAPPINGS:
 - "BHK" = Bedroom-Hall-Kitchen configuration
   - 1BHK = 1 BEDROOM + 1 LIVING_ROOM + 1 KITCHEN + 1 BATHROOM
-  - 2BHK = 1 MASTER_BEDROOM + 1 BEDROOM + 1 LIVING_ROOM + 1 KITCHEN + 2 BATHROOMS
-  - 3BHK = 1 MASTER_BEDROOM + 2 BEDROOMS + 1 LIVING_ROOM + 1 KITCHEN + 2 BATHROOMS
-  - 4BHK = 1 MASTER_BEDROOM + 3 BEDROOMS + 1 LIVING_ROOM + 1 KITCHEN + 3 BATHROOMS
+  - 2BHK = 1 MASTER_BEDROOM + 1 BEDROOM + 1 LIVING_ROOM + 1 KITCHEN + 2 BATHROOMS + 1 CORRIDOR
+  - 3BHK = 1 MASTER_BEDROOM + 2 BEDROOMS + 1 LIVING_ROOM + 1 KITCHEN + 3 BATHROOMS + 1 CORRIDOR
+  - 4BHK = 1 MASTER_BEDROOM + 3 BEDROOMS + 1 LIVING_ROOM + 1 KITCHEN + 4 BATHROOMS + 1 CORRIDOR
 - "Pooja room" → STUDY
 - "Verandah" → BALCONY
 - "Drawing room" → LIVING_ROOM
@@ -97,11 +146,18 @@ INDIAN TERMINOLOGY MAPPINGS:
 - "Store room" → UTILITY
 - "Car parking" → GARAGE
 
+ARCHITECTURAL RULES (MUST FOLLOW):
+- Every BEDROOM and MASTER_BEDROOM MUST have its own attached BATHROOM connected via a DOOR adjacency.
+- For 2+ bedroom layouts, always include exactly one CORRIDOR room (4-6 sqm) that acts as a hallway.
+- The CORRIDOR connects to all major rooms (LIVING_ROOM, KITCHEN, each BEDROOM/MASTER_BEDROOM) via DOOR adjacencies.
+- Bathrooms are accessed ONLY through their parent bedroom (DOOR), NOT through the corridor.
+- LIVING_ROOM connects to KITCHEN via OPENING.
+- KITCHEN connects to DINING (if present) via OPENING.
+
 DEFAULTS:
 - If no plot area mentioned, use 100.0 sqm
 - If no facing mentioned, use NORTH
-- Assign reasonable areas: LIVING_ROOM=20-30, BEDROOM=12-18, MASTER_BEDROOM=16-24, KITCHEN=8-14, BATHROOM=4-8, BALCONY=4-8, CORRIDOR=4-6
-- Always add adjacency constraints between: MASTER_BEDROOM↔BATHROOM(DOOR), LIVING_ROOM↔KITCHEN(OPENING), KITCHEN↔DINING(OPENING) if applicable
+- Assign reasonable areas: LIVING_ROOM=20-30, BEDROOM=12-18, MASTER_BEDROOM=16-24, KITCHEN=8-14, BATHROOM=4-6 (en-suite), BALCONY=4-8, CORRIDOR=4-6
 - Generate unique room_id values like "room_1", "room_2", etc.
 """
 
@@ -390,6 +446,7 @@ def validate_and_repair(
 
     # Always fix common issues before first attempt
     raw_json = _fix_common_issues(raw_json)
+    raw_json = _enforce_layout_rules(raw_json, stated_bedroom_count)
 
     for attempt in range(max_repairs + 1):
         try:
@@ -401,6 +458,7 @@ def validate_and_repair(
                     details={"raw_json": raw_json, "last_error": str(e)},
                 )
             raw_json = _fix_common_issues(raw_json)
+            raw_json = _enforce_layout_rules(raw_json, stated_bedroom_count)
             continue
 
         # Check bedroom count
@@ -435,6 +493,8 @@ def validate_and_repair(
         logger.info(f"Repair pass {attempt + 1}: requesting {missing} more bedrooms")
         try:
             raw_json = call_llm(repair_prompt, build_system_prompt())
+            raw_json = _fix_common_issues(raw_json)
+            raw_json = _enforce_layout_rules(raw_json, stated_bedroom_count)
         except Exception as e:
             logger.warning(f"Repair call failed: {e}")
             return layout
@@ -482,6 +542,310 @@ def _fix_common_issues(raw_json: dict) -> dict:
     if "adjacency_constraints" not in fixed:
         fixed["adjacency_constraints"] = []
     if "style_hints" not in fixed:
+        fixed["style_hints"] = []
+
+    return fixed
+
+
+def _room_type_from_string(value: str) -> Optional[RoomType]:
+    if not value:
+        return None
+    key = value.upper().replace(" ", "_").strip()
+    synonyms = {
+        "MASTER": "MASTER_BEDROOM",
+        "MASTER_ROOM": "MASTER_BEDROOM",
+        "MASTERBEDROOM": "MASTER_BEDROOM",
+        "MBEDROOM": "MASTER_BEDROOM",
+        "LIVING": "LIVING_ROOM",
+        "HALL": "LIVING_ROOM",
+        "DRAWING_ROOM": "LIVING_ROOM",
+        "DINING_ROOM": "DINING",
+        "POOJA_ROOM": "STUDY",
+        "VERANDAH": "BALCONY",
+        "WASHROOM": "BATHROOM",
+        "BATH": "BATHROOM",
+        "WC": "TOILET",
+        "RESTROOM": "TOILET",
+        "STORE_ROOM": "UTILITY",
+        "WASH_AREA": "UTILITY",
+        "CAR_PARKING": "GARAGE",
+    }
+    if key in synonyms:
+        key = synonyms[key]
+    if key in RoomType.__members__:
+        return RoomType[key]
+    return None
+
+
+def _enforce_layout_rules(raw_json: dict, bedroom_count: int) -> dict:
+    fixed = dict(raw_json)
+    rooms_in = fixed.get("rooms", [])
+    rooms: list[dict] = []
+    used_ids: set[str] = set()
+    next_id = 1
+
+    def reserve_id(rid: str | None) -> str:
+        nonlocal next_id
+        if isinstance(rid, str):
+            rid = rid.strip()
+        if not rid or rid in used_ids:
+            rid = f"room_{next_id}"
+            next_id += 1
+        else:
+            m = re.match(r"room_(\d+)$", rid)
+            if m:
+                next_id = max(next_id, int(m.group(1)) + 1)
+        used_ids.add(rid)
+        return rid
+
+    for room in rooms_in:
+        if not isinstance(room, dict):
+            continue
+        rt = _room_type_from_string(str(room.get("room_type", "")))
+        if rt is None and isinstance(room.get("label"), str):
+            rt = _room_type_from_string(room["label"])
+        if rt is None:
+            continue
+
+        rid = reserve_id(room.get("room_id"))
+        area = room.get("target_area_sqm")
+        if not isinstance(area, (int, float)):
+            area = ROOM_DEFAULT_AREA.get(rt, 10.0)
+        area = max(4.0, min(float(area), 200.0))
+
+        cp = room.get("compass_preference")
+        if isinstance(cp, str):
+            cp_upper = cp.upper().strip()
+            cp_val = cp_upper if cp_upper in {"NORTH", "SOUTH", "EAST", "WEST"} else None
+        else:
+            cp_val = None
+
+        label = room.get("label") if isinstance(room.get("label"), str) else None
+
+        rooms.append({
+            "room_id": rid,
+            "room_type": rt.value,
+            "target_area_sqm": round(area, 1),
+            "compass_preference": cp_val,
+            "label": label,
+        })
+
+    def add_room(rt: RoomType, count: int = 1) -> list[str]:
+        """Add room(s) and return list of new room IDs."""
+        nonlocal next_id
+        new_ids = []
+        for _ in range(count):
+            rid = f"room_{next_id}"
+            rooms.append({
+                "room_id": rid,
+                "room_type": rt.value,
+                "target_area_sqm": ROOM_DEFAULT_AREA.get(rt, 10.0),
+                "compass_preference": None,
+                "label": None,
+            })
+            new_ids.append(rid)
+            next_id += 1
+        return new_ids
+
+    def count_rooms(rt: RoomType) -> int:
+        return sum(1 for r in rooms if r["room_type"] == rt.value)
+
+    def count_bathrooms() -> int:
+        return sum(1 for r in rooms if r["room_type"] in {
+            RoomType.BATHROOM.value, RoomType.TOILET.value
+        })
+
+    if not rooms:
+        add_room(RoomType.LIVING_ROOM, 1)
+        add_room(RoomType.KITCHEN, 1)
+        add_room(RoomType.BEDROOM, 1)
+        add_room(RoomType.BATHROOM, 1)
+
+    if bedroom_count in BHK_TARGETS:
+        targets = BHK_TARGETS[bedroom_count]
+        for rt, target_count in targets.items():
+            existing = count_rooms(rt)
+            if rt == RoomType.BATHROOM:
+                existing = count_bathrooms()
+            if existing < target_count:
+                add_room(rt, target_count - existing)
+    elif bedroom_count > 0:
+        # Minimum viable home
+        if count_rooms(RoomType.LIVING_ROOM) < 1:
+            add_room(RoomType.LIVING_ROOM, 1)
+        if count_rooms(RoomType.KITCHEN) < 1:
+            add_room(RoomType.KITCHEN, 1)
+        if count_bathrooms() < 1:
+            add_room(RoomType.BATHROOM, 1)
+
+        # Ensure bedrooms count, with a master bedroom if possible
+        existing_master = count_rooms(RoomType.MASTER_BEDROOM)
+        existing_bed = count_rooms(RoomType.BEDROOM)
+        total_bed = existing_master + existing_bed
+        if bedroom_count >= 2 and existing_master == 0:
+            add_room(RoomType.MASTER_BEDROOM, 1)
+            total_bed += 1
+        if total_bed < bedroom_count:
+            add_room(RoomType.BEDROOM, bedroom_count - total_bed)
+
+        # Add corridor for 2+ bedrooms
+        if bedroom_count >= 2 and count_rooms(RoomType.CORRIDOR) < 1:
+            add_room(RoomType.CORRIDOR, 1)
+
+    # Rebuild adjacency constraints with valid room ids
+    valid_ids = {r["room_id"] for r in rooms}
+    edges_in = fixed.get("adjacency_constraints", [])
+    edges: list[dict] = []
+    for edge in edges_in:
+        if not isinstance(edge, dict):
+            continue
+        a = edge.get("room_a_id")
+        b = edge.get("room_b_id")
+        if a not in valid_ids or b not in valid_ids or a == b:
+            continue
+        ct = edge.get("connection_type")
+        if isinstance(ct, str):
+            ct_upper = ct.upper().strip()
+            ct_val = ct_upper if ct_upper in ConnectionType.__members__ else "OPENING"
+        else:
+            ct_val = "OPENING"
+        edges.append({
+            "room_a_id": a,
+            "room_b_id": b,
+            "connection_type": ct_val,
+            "required": bool(edge.get("required", True)),
+        })
+
+    def edge_exists(a: str, b: str, ct: str | None = None) -> bool:
+        for e in edges:
+            if {e["room_a_id"], e["room_b_id"]} == {a, b}:
+                if ct is None or e["connection_type"] == ct:
+                    return True
+        return False
+
+    def any_edge_exists(a: str, b: str) -> bool:
+        return edge_exists(a, b, None)
+
+    def first_room_id(rt: RoomType) -> Optional[str]:
+        for r in rooms:
+            if r["room_type"] == rt.value:
+                return r["room_id"]
+        return None
+
+    # ── RULE: Every bedroom/master_bedroom must have a DOOR to a bathroom ──
+    bedroom_types = {RoomType.BEDROOM.value, RoomType.MASTER_BEDROOM.value}
+    bathroom_types = {RoomType.BATHROOM.value, RoomType.TOILET.value}
+
+    # Collect bedroom IDs and bathroom IDs
+    bedroom_ids = [r["room_id"] for r in rooms if r["room_type"] in bedroom_types]
+    bathroom_ids = [r["room_id"] for r in rooms if r["room_type"] in bathroom_types]
+
+    # Track which bathrooms are already "claimed" by a bedroom
+    claimed_bathrooms: set[str] = set()
+    for e in edges:
+        if e["connection_type"] == "DOOR":
+            a_type = next((r["room_type"] for r in rooms if r["room_id"] == e["room_a_id"]), None)
+            b_type = next((r["room_type"] for r in rooms if r["room_id"] == e["room_b_id"]), None)
+            if a_type in bedroom_types and b_type in bathroom_types:
+                claimed_bathrooms.add(e["room_b_id"])
+            elif b_type in bedroom_types and a_type in bathroom_types:
+                claimed_bathrooms.add(e["room_a_id"])
+
+    # Assign one bathroom per bedroom
+    for bed_id in bedroom_ids:
+        # Check if this bedroom already has a bathroom DOOR edge
+        has_bath = False
+        for e in edges:
+            if e["connection_type"] == "DOOR" and bed_id in {e["room_a_id"], e["room_b_id"]}:
+                other = e["room_b_id"] if e["room_a_id"] == bed_id else e["room_a_id"]
+                other_type = next((r["room_type"] for r in rooms if r["room_id"] == other), None)
+                if other_type in bathroom_types:
+                    has_bath = True
+                    break
+        if has_bath:
+            continue
+
+        # Find an unclaimed bathroom
+        assigned = False
+        for bath_id in bathroom_ids:
+            if bath_id not in claimed_bathrooms:
+                edges.append({
+                    "room_a_id": bed_id,
+                    "room_b_id": bath_id,
+                    "connection_type": "DOOR",
+                    "required": True,
+                })
+                claimed_bathrooms.add(bath_id)
+                assigned = True
+                break
+
+        # If no unclaimed bathroom, create a new one
+        if not assigned:
+            new_ids = add_room(RoomType.BATHROOM, 1)
+            new_bath_id = new_ids[0]
+            bathroom_ids.append(new_bath_id)
+            edges.append({
+                "room_a_id": bed_id,
+                "room_b_id": new_bath_id,
+                "connection_type": "DOOR",
+                "required": True,
+            })
+            claimed_bathrooms.add(new_bath_id)
+
+    # ── RULE: Living room ↔ Kitchen (OPENING) ──
+    living_id = first_room_id(RoomType.LIVING_ROOM)
+    kitchen_id = first_room_id(RoomType.KITCHEN)
+    dining_id = first_room_id(RoomType.DINING)
+
+    if living_id and kitchen_id and not edge_exists(living_id, kitchen_id, "OPENING"):
+        edges.append({
+            "room_a_id": living_id,
+            "room_b_id": kitchen_id,
+            "connection_type": "OPENING",
+            "required": True,
+        })
+    if kitchen_id and dining_id and not edge_exists(kitchen_id, dining_id, "OPENING"):
+        edges.append({
+            "room_a_id": kitchen_id,
+            "room_b_id": dining_id,
+            "connection_type": "OPENING",
+            "required": True,
+        })
+
+    # ── RULE: Corridor connects to all major rooms (not bathrooms) ──
+    corridor_id = first_room_id(RoomType.CORRIDOR)
+    if corridor_id:
+        corridor_connectable_types = {
+            RoomType.LIVING_ROOM.value, RoomType.KITCHEN.value,
+            RoomType.MASTER_BEDROOM.value, RoomType.BEDROOM.value,
+            RoomType.STUDY.value, RoomType.DINING.value,
+            RoomType.BALCONY.value, RoomType.UTILITY.value,
+            RoomType.GARAGE.value,
+        }
+        for r in rooms:
+            if r["room_type"] in corridor_connectable_types and r["room_id"] != corridor_id:
+                if not any_edge_exists(corridor_id, r["room_id"]):
+                    edges.append({
+                        "room_a_id": corridor_id,
+                        "room_b_id": r["room_id"],
+                        "connection_type": "DOOR",
+                        "required": True,
+                    })
+
+    # Plot area sanity
+    total_area = sum(float(r["target_area_sqm"]) for r in rooms) if rooms else 0.0
+    plot = fixed.get("plot_area_sqm")
+    if not isinstance(plot, (int, float)):
+        plot = 100.0
+    min_plot = max(30.0, total_area * 1.1)
+    plot = max(float(plot), min_plot)
+    plot = min(plot, 2000.0)
+
+    fixed["rooms"] = rooms
+    fixed["adjacency_constraints"] = edges
+    fixed["plot_area_sqm"] = round(plot, 1)
+
+    if not isinstance(fixed.get("style_hints"), list):
         fixed["style_hints"] = []
 
     return fixed

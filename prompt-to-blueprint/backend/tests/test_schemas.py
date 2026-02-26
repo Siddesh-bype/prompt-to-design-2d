@@ -38,7 +38,7 @@ def test_invalid_area_range():
         RoomSpec(
             room_id="room_bad",
             room_type=RoomType.BEDROOM,
-            target_area_sqm=100.0,  # Above maximum of 80.0
+            target_area_sqm=250.0,  # Above maximum of 200.0
         )
 
 

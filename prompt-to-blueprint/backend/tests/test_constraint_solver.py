@@ -7,7 +7,7 @@ from app.models.schemas import (
 )
 from app.services.constraint_solver import (
     heuristic_place, run_constraint_pipeline,
-    _compute_overlap, _compute_adjacency,
+    _compute_overlap, _compute_adjacency, _improve_adjacency_by_swapping,
 )
 
 
@@ -88,3 +88,47 @@ def test_pipeline_produces_valid_output():
     assert len(result.rooms) == len(layout.rooms)
     assert result.overlap_rate >= 0.0
     assert result.adjacency_satisfaction >= 0.0
+
+
+def test_adjacency_swap_improves_required_edges():
+    """Swap helper should improve required adjacency when a better assignment exists."""
+    rooms = [
+        # r1 at NW
+        RoomLayout(
+            room_spec=RoomSpec(room_id="r1", room_type=RoomType.LIVING_ROOM, target_area_sqm=20.0),
+            bbox=BoundingBox(x_min=0.0, y_min=0.0, x_max=0.5, y_max=0.5),
+        ),
+        # r2 at SE (not adjacent to r1)
+        RoomLayout(
+            room_spec=RoomSpec(room_id="r2", room_type=RoomType.KITCHEN, target_area_sqm=12.0),
+            bbox=BoundingBox(x_min=0.5, y_min=0.5, x_max=1.0, y_max=1.0),
+        ),
+        # r3 at NE (adjacent to r1)
+        RoomLayout(
+            room_spec=RoomSpec(room_id="r3", room_type=RoomType.BEDROOM, target_area_sqm=14.0),
+            bbox=BoundingBox(x_min=0.5, y_min=0.0, x_max=1.0, y_max=0.5),
+        ),
+    ]
+    edges = [
+        AdjacencyEdge(
+            room_a_id="r1",
+            room_b_id="r2",
+            connection_type=ConnectionType.OPENING,
+            required=True,
+        ),
+    ]
+
+    base_layout = LayoutGraph(
+        rooms=rooms,
+        adjacency_edges=edges,
+        plot_area_sqm=100.0,
+        facing=CompassFacing.NORTH,
+    )
+    base_adj = _compute_adjacency(base_layout, 10.0, 10.0)
+
+    improved_rooms = _improve_adjacency_by_swapping(rooms, edges, 10.0, 10.0)
+    improved_layout = base_layout.model_copy(update={"rooms": improved_rooms})
+    improved_adj = _compute_adjacency(improved_layout, 10.0, 10.0)
+
+    assert improved_adj >= base_adj
+    assert improved_adj > 0.0

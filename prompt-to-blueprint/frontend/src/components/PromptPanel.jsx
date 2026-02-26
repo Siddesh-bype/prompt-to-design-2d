@@ -59,9 +59,9 @@ export default function PromptPanel() {
 
     // Quick presets
     const presets = [
-        { label: '2 BHK', text: '2BHK apartment with open kitchen, 2 bathrooms, south facing, modern style' },
-        { label: '3 BHK', text: '3BHK flat with master bedroom attached bathroom, modular kitchen, study room, north facing' },
-        { label: 'Vastu', text: '3BHK vastu-compliant house, pooja room in NE, kitchen in SE, master bedroom in SW, 1200 sqft' },
+        { label: '2 BHK', text: '2BHK apartment with open kitchen, each bedroom with attached bathroom, corridor connecting all rooms, south facing, modern style' },
+        { label: '3 BHK', text: '3BHK flat with master bedroom and attached bathroom, 2 bedrooms each with attached bathroom, modular kitchen, study room, corridor, north facing' },
+        { label: 'Vastu', text: '3BHK vastu-compliant house, pooja room in NE, kitchen in SE, master bedroom in SW with attached bath, corridor, 1200 sqft' },
     ];
 
     return (
@@ -145,8 +145,8 @@ export default function PromptPanel() {
                                     key={dir}
                                     onClick={() => setFacing(dir)}
                                     className={`px-2 py-1.5 text-xs rounded-md border transition-all ${facing === dir
-                                            ? 'bg-blueprint-600 border-blueprint-500 text-white'
-                                            : 'bg-surface-700 border-surface-600 text-surface-300 hover:border-surface-500'
+                                        ? 'bg-blueprint-600 border-blueprint-500 text-white'
+                                        : 'bg-surface-700 border-surface-600 text-surface-300 hover:border-surface-500'
                                         }`}
                                     disabled={isGenerating}
                                 >
@@ -198,8 +198,8 @@ export default function PromptPanel() {
                     onClick={handleGenerate}
                     disabled={isGenerating || prompt.trim().length < 10}
                     className={`w-full py-2.5 rounded-lg font-medium text-sm transition-all ${isGenerating || prompt.trim().length < 10
-                            ? 'bg-surface-600 text-surface-400 cursor-not-allowed'
-                            : 'bg-gradient-to-r from-blueprint-600 to-blueprint-500 text-white hover:from-blueprint-500 hover:to-blueprint-400 shadow-lg shadow-blueprint-500/25 active:scale-[0.98]'
+                        ? 'bg-surface-600 text-surface-400 cursor-not-allowed'
+                        : 'bg-gradient-to-r from-blueprint-600 to-blueprint-500 text-white hover:from-blueprint-500 hover:to-blueprint-400 shadow-lg shadow-blueprint-500/25 active:scale-[0.98]'
                         }`}
                 >
                     {isGenerating ? 'Generating...' : '⚡ Generate Floor Plan'}

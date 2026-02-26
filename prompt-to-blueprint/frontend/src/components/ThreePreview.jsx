@@ -104,7 +104,6 @@ function Room({ bbox, roomType, label, plotWidth = 10, plotHeight = 10, isHovere
                 color="#E2E8F0"
                 anchorX="center"
                 anchorY="bottom"
-                font="/fonts/inter-medium.woff"
                 outlineWidth={0.02}
                 outlineColor="#0F172A"
             >

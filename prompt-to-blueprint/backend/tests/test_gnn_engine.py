@@ -122,3 +122,23 @@ def test_loss_computation():
     assert losses["overlap"].dim() == 0
     assert losses["adj_bce"].dim() == 0
     assert losses["total"].item() >= 0
+
+
+def test_inference_enforces_min_bbox_size(monkeypatch):
+    """Post-processing should enforce minimum bbox width/height >= 0.05."""
+    layout = _make_test_layout()
+
+    def fake_forward(self, x, edge_index, edge_attr=None):
+        n = x.size(0)
+        # Tiny (almost degenerate) boxes to trigger post-processing expansion.
+        bbox = torch.tensor([[0.99, 0.99, 0.991, 0.991]] * n, dtype=torch.float32)
+        return bbox, None
+
+    monkeypatch.setattr(FloorPlanGNN, "forward", fake_forward)
+
+    result = run_gnn_inference(layout, model_path="nonexistent_model.pt")
+    for room in result.rooms:
+        width = room.bbox.x_max - room.bbox.x_min
+        height = room.bbox.y_max - room.bbox.y_min
+        assert width >= 0.05
+        assert height >= 0.05

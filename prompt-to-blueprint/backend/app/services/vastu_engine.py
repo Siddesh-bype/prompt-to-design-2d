@@ -197,7 +197,10 @@ def check_vastu(layout: LayoutGraph) -> VastuResponse:
         # Get zone
         zone = get_vastu_zone(cx, cy)
         room_name = room.room_spec.label or room.room_spec.room_type.value.replace("_", " ").title()
-        zone_map[zone] = room_name
+        if zone in zone_map:
+            zone_map[zone] = f"{zone_map[zone]}, {room_name}"
+        else:
+            zone_map[zone] = room_name
 
         # Look up score
         key = (zone, room.room_spec.room_type)

@@ -150,8 +150,8 @@ export default function ExportToolbar({ viewMode = '2d', onViewModeChange }) {
                     <button
                         onClick={() => onViewModeChange?.('2d')}
                         className={`px-2.5 py-1 rounded-md text-xs font-medium transition-all ${viewMode === '2d'
-                                ? 'bg-blueprint-600 text-white shadow-sm'
-                                : 'text-surface-400 hover:text-surface-200'
+                            ? 'bg-blueprint-600 text-white shadow-sm'
+                            : 'text-surface-400 hover:text-surface-200'
                             }`}
                     >
                         2D
@@ -159,8 +159,8 @@ export default function ExportToolbar({ viewMode = '2d', onViewModeChange }) {
                     <button
                         onClick={() => onViewModeChange?.('3d')}
                         className={`px-2.5 py-1 rounded-md text-xs font-medium transition-all ${viewMode === '3d'
-                                ? 'bg-blueprint-600 text-white shadow-sm'
-                                : 'text-surface-400 hover:text-surface-200'
+                            ? 'bg-blueprint-600 text-white shadow-sm'
+                            : 'text-surface-400 hover:text-surface-200'
                             }`}
                     >
                         3D
@@ -200,6 +200,6 @@ export default function ExportToolbar({ viewMode = '2d', onViewModeChange }) {
                     {exporting === 'dxf' ? 'Saving...' : 'DXF'}
                 </button>
             </div>
-        </div>
+        </div >
     );
 }

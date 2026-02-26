@@ -102,13 +102,25 @@ def layout_to_svg(
         "style": "background: #FFFFFF; font-family: Arial, sans-serif;",
     })
 
-    # Defs (could add patterns/gradients here)
+    # Defs (patterns/gradients)
     defs = ET.SubElement(svg, "defs")
 
     # Shadow filter
     shadow_filter = ET.SubElement(defs, "filter", {"id": "shadow", "x": "-2%", "y": "-2%", "width": "104%", "height": "104%"})
     ET.SubElement(shadow_filter, "feDropShadow", {
         "dx": "1", "dy": "1", "stdDeviation": "2", "flood-opacity": "0.1",
+    })
+
+    # Corridor hatching pattern
+    hatch_pattern = ET.SubElement(defs, "pattern", {
+        "id": "corridor-hatch",
+        "patternUnits": "userSpaceOnUse",
+        "width": "8", "height": "8",
+        "patternTransform": "rotate(45)",
+    })
+    ET.SubElement(hatch_pattern, "line", {
+        "x1": "0", "y1": "0", "x2": "0", "y2": "8",
+        "stroke": "#CBD5E1", "stroke-width": "1.5",
     })
 
     # Background
@@ -131,6 +143,9 @@ def layout_to_svg(
     # Compass indicator
     _add_compass(svg, canvas_width_px - 50, 50, layout.facing.value)
 
+    # Track door midpoints already drawn (avoid duplicates)
+    drawn_doors: set[tuple[int, int]] = set()
+
     # Room rectangles
     for room in layout.rooms:
         bbox = room.bbox
@@ -140,6 +155,7 @@ def layout_to_svg(
         h = (bbox.y_max - bbox.y_min) * draw_h
 
         fill = ROOM_COLOURS.get(room.room_spec.room_type, DEFAULT_COLOUR)
+        is_corridor = room.room_spec.room_type == RoomType.CORRIDOR
 
         # Room rectangle
         ET.SubElement(svg, "rect", {
@@ -154,6 +170,16 @@ def layout_to_svg(
             "filter": "url(#shadow)",
         })
 
+        # Corridor hatching overlay
+        if is_corridor:
+            ET.SubElement(svg, "rect", {
+                "x": f"{x:.1f}", "y": f"{y:.1f}",
+                "width": f"{w:.1f}", "height": f"{h:.1f}",
+                "fill": "url(#corridor-hatch)",
+                "stroke": "none",
+                "opacity": "0.4",
+            })
+
         # Room label
         if show_room_labels:
             display_name = room.room_spec.room_type.value.replace("_", " ").title()
@@ -164,8 +190,8 @@ def layout_to_svg(
             cx = x + w / 2
             cy = y + h / 2
 
-            # Truncate label if room is small
-            font_size = min(11, max(8, w / 8))
+            # Adjust font size based on room size
+            font_size = min(11, max(7, min(w, h) / 6))
 
             name_elem = ET.SubElement(svg, "text", {
                 "x": f"{cx:.1f}", "y": f"{cy - 6:.1f}",
@@ -220,17 +246,53 @@ def layout_to_svg(
             })
             dim_text_r.text = f"{room_h_m:.1f}m"
 
-        # Door markers
+        # Door arc markers
         for dx, dy in room.door_midpoints:
             door_x = pad + dx * draw_w
             door_y = pad + dy * draw_h
-            # Small arc for door
-            ET.SubElement(svg, "circle", {
-                "cx": f"{door_x:.1f}", "cy": f"{door_y:.1f}",
-                "r": "4",
-                "fill": "#2196F3",
-                "stroke": "#1565C0",
+
+            # Deduplicate: doors are shared between two rooms
+            key = (round(door_x * 10), round(door_y * 10))
+            if key in drawn_doors:
+                continue
+            drawn_doors.add(key)
+
+            # Draw an architectural door arc (quarter circle + door line)
+            arc_r = 6  # radius in pixels
+
+            # Determine door orientation based on position relative to room
+            on_vertical_wall = (abs(dx - bbox.x_min) < 0.01 or abs(dx - bbox.x_max) < 0.01)
+
+            if on_vertical_wall:
+                # Door on vertical wall: arc sweeps horizontally
+                arc_path = (
+                    f"M {door_x:.1f} {door_y - arc_r:.1f} "
+                    f"A {arc_r} {arc_r} 0 0 1 {door_x + arc_r:.1f} {door_y:.1f}"
+                )
+                ET.SubElement(svg, "line", {
+                    "x1": f"{door_x:.1f}", "y1": f"{door_y - arc_r:.1f}",
+                    "x2": f"{door_x:.1f}", "y2": f"{door_y + arc_r:.1f}",
+                    "stroke": "#2196F3", "stroke-width": "2",
+                })
+            else:
+                # Door on horizontal wall: arc sweeps vertically
+                arc_path = (
+                    f"M {door_x - arc_r:.1f} {door_y:.1f} "
+                    f"A {arc_r} {arc_r} 0 0 1 {door_x:.1f} {door_y - arc_r:.1f}"
+                )
+                ET.SubElement(svg, "line", {
+                    "x1": f"{door_x - arc_r:.1f}", "y1": f"{door_y:.1f}",
+                    "x2": f"{door_x + arc_r:.1f}", "y2": f"{door_y:.1f}",
+                    "stroke": "#2196F3", "stroke-width": "2",
+                })
+
+            # Draw the arc
+            ET.SubElement(svg, "path", {
+                "d": arc_path,
+                "fill": "none",
+                "stroke": "#2196F3",
                 "stroke-width": "1.5",
+                "stroke-dasharray": "3,2",
             })
 
     # Title
@@ -312,7 +374,10 @@ def layout_to_dxf(
 
     # Parse scale
     scale_parts = scale_str.split(":")
-    scale_factor = int(scale_parts[1]) if len(scale_parts) == 2 else 100
+    try:
+        scale_factor = int(scale_parts[1]) if len(scale_parts) == 2 else 100
+    except (TypeError, ValueError):
+        scale_factor = 100
 
     doc = ezdxf.new("R2018")
     msp = doc.modelspace()
@@ -366,10 +431,10 @@ def layout_to_dxf(
                 dxfattribs={"layer": "DOORS"},
             )
 
-    # Write to bytes
-    stream = io.BytesIO()
-    doc.save(stream)
-    return stream.getvalue()
+    # Write to bytes (ezdxf writes text content, so we encode it explicitly)
+    text_stream = io.StringIO()
+    doc.write(text_stream)
+    return text_stream.getvalue().encode("utf-8")
 
 
 # ─── FUNCTION 3: Overlap Rate ───────────────────────────────────────────────

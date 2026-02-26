@@ -50,7 +50,12 @@ export default function CanvasEditor() {
         const target = e.target;
         if (target && target.getAttribute) {
             const roomId = target.getAttribute('data-room-id');
-            setHoveredRoom(roomId);
+            const roomType = target.getAttribute('data-room-type');
+            if (roomId && roomType) {
+                setHoveredRoom({ id: roomId, type: roomType });
+            } else {
+                setHoveredRoom(null);
+            }
         } else {
             setHoveredRoom(null);
         }
@@ -159,7 +164,10 @@ export default function CanvasEditor() {
             {/* Hovered room tooltip */}
             {hoveredRoom && layout && (
                 <div className="absolute top-4 left-4 bg-surface-800/90 backdrop-blur-sm border border-surface-700 rounded-lg px-3 py-2">
-                    <p className="text-xs text-blueprint-400 font-medium">{hoveredRoom}</p>
+                    <p className="text-xs text-blueprint-400 font-medium">
+                        {hoveredRoom.type.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}
+                    </p>
+                    <p className="text-[10px] text-surface-500 mt-0.5">{hoveredRoom.id}</p>
                 </div>
             )}
         </div>

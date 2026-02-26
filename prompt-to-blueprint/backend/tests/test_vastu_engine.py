@@ -88,3 +88,27 @@ def test_vastu_bad_placement_generates_suggestions():
     result = check_vastu(layout)
     assert len(result.suggestions) > 0
     assert any("Kitchen" in s for s in result.suggestions)
+
+
+def test_zone_map_keeps_multiple_rooms_in_same_zone():
+    """Multiple rooms in one zone should not overwrite earlier zone_map entries."""
+    layout = LayoutGraph(
+        rooms=[
+            RoomLayout(
+                room_spec=RoomSpec(room_id="r1", room_type=RoomType.BEDROOM, target_area_sqm=12.0, label="Bedroom A"),
+                bbox=BoundingBox(x_min=0.02, y_min=0.02, x_max=0.20, y_max=0.20),  # NW
+            ),
+            RoomLayout(
+                room_spec=RoomSpec(room_id="r2", room_type=RoomType.STUDY, target_area_sqm=8.0, label="Study B"),
+                bbox=BoundingBox(x_min=0.22, y_min=0.02, x_max=0.30, y_max=0.20),  # NW
+            ),
+        ],
+        adjacency_edges=[],
+        plot_area_sqm=100.0,
+        facing=CompassFacing.NORTH,
+    )
+
+    result = check_vastu(layout)
+    assert "NW" in result.zone_map
+    assert "Bedroom A" in result.zone_map["NW"]
+    assert "Study B" in result.zone_map["NW"]

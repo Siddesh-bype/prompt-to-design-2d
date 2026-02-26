@@ -320,7 +320,11 @@ def run_gnn_inference(
     model = FloorPlanGNN()
 
     if os.path.exists(model_path):
-        state_dict = torch.load(model_path, map_location=device, weights_only=True)
+        try:
+            state_dict = torch.load(model_path, map_location=device, weights_only=True)
+        except TypeError:
+            # Compatibility with older torch versions that do not support weights_only.
+            state_dict = torch.load(model_path, map_location=device)
         model.load_state_dict(state_dict)
         logger.info(f"Loaded GNN weights from {model_path}")
     else:
@@ -363,10 +367,31 @@ def run_gnn_inference(
     # Ensure minimum size (at least 0.05 in normalised coords for a 10m plot = 0.5m)
     min_size = 0.05
     for i in range(bbox_pred.size(0)):
-        if bbox_pred[i, 2] - bbox_pred[i, 0] < min_size:
-            bbox_pred[i, 2] = min(bbox_pred[i, 0] + min_size, 1.0)
-        if bbox_pred[i, 3] - bbox_pred[i, 1] < min_size:
-            bbox_pred[i, 3] = min(bbox_pred[i, 1] + min_size, 1.0)
+        x_min = float(bbox_pred[i, 0])
+        y_min = float(bbox_pred[i, 1])
+        x_max = float(bbox_pred[i, 2])
+        y_max = float(bbox_pred[i, 3])
+
+        if x_max - x_min < min_size:
+            cx = (x_min + x_max) / 2.0
+            x_min = max(0.0, cx - min_size / 2.0)
+            x_max = min(1.0, cx + min_size / 2.0)
+            if x_max - x_min < min_size:
+                x_min = max(0.0, x_max - min_size)
+                x_max = min(1.0, x_min + min_size)
+
+        if y_max - y_min < min_size:
+            cy = (y_min + y_max) / 2.0
+            y_min = max(0.0, cy - min_size / 2.0)
+            y_max = min(1.0, cy + min_size / 2.0)
+            if y_max - y_min < min_size:
+                y_min = max(0.0, y_max - min_size)
+                y_max = min(1.0, y_min + min_size)
+
+        bbox_pred[i, 0] = x_min
+        bbox_pred[i, 1] = y_min
+        bbox_pred[i, 2] = x_max
+        bbox_pred[i, 3] = y_max
 
     # Build LayoutGraph
     rooms = []

@@ -105,6 +105,21 @@ def test_dxf_layers_created():
     assert "PLOT_BOUNDARY" in layer_names
 
 
+def test_dxf_export_returns_non_empty_bytes():
+    """DXF export should return non-empty byte content."""
+    if not HAS_EZDXF:
+        pytest.skip("ezdxf not installed")
+
+    from app.services.renderer import layout_to_dxf
+
+    layout = _make_non_overlapping_layout()
+    dxf_bytes = layout_to_dxf(layout)
+
+    assert isinstance(dxf_bytes, (bytes, bytearray))
+    assert len(dxf_bytes) > 0
+    assert b"SECTION" in dxf_bytes
+
+
 def test_overlap_rate_zero_for_non_overlapping():
     """Non-overlapping rooms should have overlap_rate == 0."""
     layout = _make_non_overlapping_layout()

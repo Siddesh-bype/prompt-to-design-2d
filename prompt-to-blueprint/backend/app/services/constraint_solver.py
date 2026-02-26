@@ -12,6 +12,7 @@ import math
 from typing import Optional
 
 from app.models.schemas import (
+    AdjacencyEdge,
     BoundingBox,
     CompassFacing,
     LayoutGraph,
@@ -76,7 +77,8 @@ def solve_with_z3(
         return layout, True
 
     solver = z3.Solver()
-    z3.set_option("timeout", timeout_ms)
+    # Use a solver-local timeout to avoid global side effects across requests.
+    solver.set("timeout", timeout_ms)
 
     # Create Z3 Real variables for each room's bbox
     vars_dict = {}
@@ -361,17 +363,48 @@ def heuristic_place(
     plot_width: float = 10.0,
     plot_height: float = 10.0,
 ) -> LayoutGraph:
-    """Place rooms using a squarified treemap algorithm.
+    """Place rooms using a squarified treemap algorithm with en-suite nesting.
 
-    Recursively subdivides the plot rectangle so rooms fill the
-    entire area with zero gaps. Each room's slice is proportional
-    to its target_area_sqm.
+    Pipeline:
+    1. Identify en-suite bathrooms (those with DOOR to a bedroom)
+    2. Exclude en-suites from treemap — they'll be nested inside bedrooms
+    3. Run treemap on remaining rooms
+    4. Carve en-suite bathrooms inside their parent bedrooms
+    5. Place corridor as a central connecting strip (if present)
+    6. Generate door midpoints on shared walls
     """
     n = len(layout.rooms)
     if n == 0:
         return layout
 
-    # Sort rooms by priority (largest/most important first)
+    # ── Step 1: Identify en-suite bathroom → bedroom pairs ──
+    ensuite_pairs: dict[str, str] = {}  # bathroom_id → bedroom_id
+    bedroom_types = {RoomType.BEDROOM, RoomType.MASTER_BEDROOM}
+    bathroom_types = {RoomType.BATHROOM, RoomType.TOILET}
+
+    for edge in layout.adjacency_edges:
+        if edge.connection_type.value != "DOOR":
+            continue
+        room_a = next((r for r in layout.rooms if r.room_spec.room_id == edge.room_a_id), None)
+        room_b = next((r for r in layout.rooms if r.room_spec.room_id == edge.room_b_id), None)
+        if room_a is None or room_b is None:
+            continue
+
+        bed_room, bath_room = None, None
+        if room_a.room_spec.room_type in bedroom_types and room_b.room_spec.room_type in bathroom_types:
+            bed_room, bath_room = room_a, room_b
+        elif room_b.room_spec.room_type in bedroom_types and room_a.room_spec.room_type in bathroom_types:
+            bed_room, bath_room = room_b, room_a
+
+        if bed_room and bath_room and bath_room.room_spec.room_id not in ensuite_pairs:
+            ensuite_pairs[bath_room.room_spec.room_id] = bed_room.room_spec.room_id
+
+    # ── Step 2: Separate en-suite bathrooms from main layout ──
+    ensuite_bath_ids = set(ensuite_pairs.keys())
+    main_rooms = [r for r in layout.rooms if r.room_spec.room_id not in ensuite_bath_ids]
+    ensuite_rooms = [r for r in layout.rooms if r.room_spec.room_id in ensuite_bath_ids]
+
+    # Sort main rooms by priority
     def priority_key(room: RoomLayout) -> tuple[int, float]:
         try:
             pri = ROOM_PRIORITY.index(room.room_spec.room_type)
@@ -379,46 +412,381 @@ def heuristic_place(
             pri = len(ROOM_PRIORITY)
         return (pri, -room.room_spec.target_area_sqm)
 
-    sorted_rooms = sorted(layout.rooms, key=priority_key)
+    sorted_rooms = sorted(main_rooms, key=priority_key)
 
-    # Compute area weights (normalised so they sum to 1.0)
+    if not sorted_rooms:
+        sorted_rooms = sorted(layout.rooms, key=priority_key)
+        ensuite_rooms = []
+        ensuite_pairs = {}
+
+    # ── Step 3: Treemap on main rooms ──
     total_area = sum(max(r.room_spec.target_area_sqm, 1.0) for r in sorted_rooms)
     weights = [max(r.room_spec.target_area_sqm, 1.0) / total_area for r in sorted_rooms]
-
-    # Recursively subdivide the rectangle
     bboxes = _treemap_subdivide(weights, 0.0, 0.0, 1.0, 1.0)
 
     placed = []
     for i, room in enumerate(sorted_rooms):
         x_min, y_min, x_max, y_max = bboxes[i]
-
-        # Clamp to [0, 1]
         x_min = max(0.0, min(x_min, 1.0))
         y_min = max(0.0, min(y_min, 1.0))
         x_max = max(0.0, min(x_max, 1.0))
         y_max = max(0.0, min(y_max, 1.0))
-
         if x_min >= x_max:
             x_max = min(x_min + 0.05, 1.0)
         if y_min >= y_max:
             y_max = min(y_min + 0.05, 1.0)
 
-        bbox = BoundingBox(
-            x_min=x_min, y_min=y_min,
-            x_max=x_max, y_max=y_max,
-        )
-        placed.append(RoomLayout(
-            room_spec=room.room_spec,
-            bbox=bbox,
-            door_midpoints=room.door_midpoints,
-        ))
+        bbox = BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
+        placed.append(RoomLayout(room_spec=room.room_spec, bbox=bbox, door_midpoints=[]))
+
+    # Improve adjacency via swapping
+    placed = _improve_adjacency_by_swapping(
+        placed, layout.adjacency_edges, plot_width, plot_height
+    )
+
+    # ── Step 4: Nest en-suite bathrooms inside bedrooms ──
+    placed = _nest_ensuite_bathrooms(placed, ensuite_rooms, ensuite_pairs)
+
+    # ── Step 5: Place corridor as a central strip (if present) ──
+    placed = _place_corridor(placed, plot_width, plot_height)
+
+    # ── Step 6: Generate door midpoints ──
+    placed = _generate_door_midpoints(placed, layout.adjacency_edges, plot_width, plot_height)
 
     result = layout.model_copy(update={
         "rooms": placed,
         "generation_mode": "heuristic",
     })
-    logger.info(f"Heuristic placer: placed {len(placed)} rooms via treemap")
+    logger.info(f"Heuristic placer: placed {len(placed)} rooms (incl. {len(ensuite_rooms)} en-suites)")
     return result
+
+
+def _nest_ensuite_bathrooms(
+    placed: list[RoomLayout],
+    ensuite_rooms: list[RoomLayout],
+    ensuite_pairs: dict[str, str],  # bath_id → bed_id
+) -> list[RoomLayout]:
+    """Carve en-suite bathrooms from a corner of their parent bedroom.
+
+    Takes ~30% of the bedroom area from the bottom-right corner.
+    Shrinks the bedroom accordingly so there's no overlap.
+    """
+    if not ensuite_pairs:
+        return placed
+
+    # Build map of placed rooms by ID
+    placed_map = {r.room_spec.room_id: r for r in placed}
+    result = list(placed)
+
+    for bath_room in ensuite_rooms:
+        bath_id = bath_room.room_spec.room_id
+        bed_id = ensuite_pairs.get(bath_id)
+        if not bed_id or bed_id not in placed_map:
+            # Fallback: put bathroom in a small corner of the plot
+            result.append(RoomLayout(
+                room_spec=bath_room.room_spec,
+                bbox=BoundingBox(x_min=0.85, y_min=0.85, x_max=1.0, y_max=1.0),
+                door_midpoints=[],
+            ))
+            continue
+
+        bed = placed_map[bed_id]
+        bx = bed.bbox
+        bed_w = bx.x_max - bx.x_min
+        bed_h = bx.y_max - bx.y_min
+
+        # En-suite takes ~30% of bedroom area, carved from bottom-right
+        # Choose split direction: split along the longer side
+        if bed_w >= bed_h:
+            # Vertical split — bathroom on the right side
+            bath_frac = 0.30
+            split_x = bx.x_max - bed_w * bath_frac
+
+            bath_bbox = BoundingBox(
+                x_min=max(0.0, split_x),
+                y_min=bx.y_min,
+                x_max=bx.x_max,
+                y_max=bx.y_max,
+            )
+            # Shrink bedroom
+            new_bed_bbox = BoundingBox(
+                x_min=bx.x_min,
+                y_min=bx.y_min,
+                x_max=max(bx.x_min + 0.05, split_x),
+                y_max=bx.y_max,
+            )
+        else:
+            # Horizontal split — bathroom on the bottom
+            bath_frac = 0.30
+            split_y = bx.y_max - bed_h * bath_frac
+
+            bath_bbox = BoundingBox(
+                x_min=bx.x_min,
+                y_min=max(0.0, split_y),
+                x_max=bx.x_max,
+                y_max=bx.y_max,
+            )
+            new_bed_bbox = BoundingBox(
+                x_min=bx.x_min,
+                y_min=bx.y_min,
+                x_max=bx.x_max,
+                y_max=max(bx.y_min + 0.05, split_y),
+            )
+
+        # Update bedroom bbox
+        updated_bed = RoomLayout(
+            room_spec=bed.room_spec,
+            bbox=new_bed_bbox,
+            door_midpoints=[],
+        )
+
+        # Replace the bedroom in the result list
+        for idx, r in enumerate(result):
+            if r.room_spec.room_id == bed_id:
+                result[idx] = updated_bed
+                break
+        placed_map[bed_id] = updated_bed
+
+        # Add the bathroom
+        result.append(RoomLayout(
+            room_spec=bath_room.room_spec,
+            bbox=bath_bbox,
+            door_midpoints=[],
+        ))
+
+    return result
+
+
+def _place_corridor(
+    placed: list[RoomLayout],
+    plot_width: float,
+    plot_height: float,
+) -> list[RoomLayout]:
+    """If a CORRIDOR room exists, reshape it as a narrow central strip.
+
+    The corridor becomes a 1.2m-wide horizontal band through the middle,
+    and adjacent rooms are pushed up/down to make space.
+    """
+    corridor_idx = None
+    for i, r in enumerate(placed):
+        if r.room_spec.room_type == RoomType.CORRIDOR:
+            corridor_idx = i
+            break
+
+    if corridor_idx is None:
+        return placed
+
+    # Corridor strip parameters (normalised)
+    corridor_width_m = 1.2  # metres
+    corridor_frac = corridor_width_m / plot_height  # normalised height
+    corridor_frac = max(0.08, min(corridor_frac, 0.15))  # clamp 8-15%
+
+    center_y = 0.5
+    corr_y_min = center_y - corridor_frac / 2
+    corr_y_max = center_y + corridor_frac / 2
+
+    # Set corridor bbox — full width, narrow band
+    corridor_room = placed[corridor_idx]
+    result = []
+
+    for i, room in enumerate(placed):
+        if i == corridor_idx:
+            result.append(RoomLayout(
+                room_spec=room.room_spec,
+                bbox=BoundingBox(x_min=0.0, y_min=corr_y_min, x_max=1.0, y_max=corr_y_max),
+                door_midpoints=[],
+            ))
+            continue
+
+        bx = room.bbox
+        # Push rooms that overlap the corridor band
+        if bx.y_min < corr_y_max and bx.y_max > corr_y_min:
+            # Room straddles the corridor — determine which side to push it
+            room_center_y = (bx.y_min + bx.y_max) / 2
+            if room_center_y <= center_y:
+                # Push to upper half
+                new_bbox = BoundingBox(
+                    x_min=bx.x_min,
+                    y_min=bx.y_min,
+                    x_max=bx.x_max,
+                    y_max=max(bx.y_min + 0.05, corr_y_min),
+                )
+            else:
+                # Push to lower half
+                new_bbox = BoundingBox(
+                    x_min=bx.x_min,
+                    y_min=min(corr_y_max, bx.y_max - 0.05),
+                    x_max=bx.x_max,
+                    y_max=bx.y_max,
+                )
+            result.append(RoomLayout(
+                room_spec=room.room_spec,
+                bbox=new_bbox,
+                door_midpoints=[],
+            ))
+        else:
+            result.append(room)
+
+    return result
+
+
+def _generate_door_midpoints(
+    placed: list[RoomLayout],
+    edges: list[AdjacencyEdge],
+    plot_width: float,
+    plot_height: float,
+) -> list[RoomLayout]:
+    """Generate door midpoint coordinates on shared walls between adjacent rooms.
+
+    For each DOOR or OPENING edge, find the shared wall and place the door
+    at the midpoint of the overlapping segment.
+    """
+    room_map = {r.room_spec.room_id: r for r in placed}
+    door_map: dict[str, list[tuple[float, float]]] = {r.room_spec.room_id: [] for r in placed}
+
+    for edge in edges:
+        if edge.connection_type.value == "WALL":
+            continue
+
+        ra = room_map.get(edge.room_a_id)
+        rb = room_map.get(edge.room_b_id)
+        if ra is None or rb is None:
+            continue
+
+        ba, bb = ra.bbox, rb.bbox
+
+        door_x, door_y = None, None
+
+        # Check vertical adjacency (rooms share a vertical wall)
+        if abs(ba.x_max - bb.x_min) < 0.015:
+            # A is left of B
+            y_overlap_min = max(ba.y_min, bb.y_min)
+            y_overlap_max = min(ba.y_max, bb.y_max)
+            if y_overlap_max - y_overlap_min > 0.02:
+                door_x = ba.x_max
+                door_y = (y_overlap_min + y_overlap_max) / 2
+        elif abs(bb.x_max - ba.x_min) < 0.015:
+            # B is left of A
+            y_overlap_min = max(ba.y_min, bb.y_min)
+            y_overlap_max = min(ba.y_max, bb.y_max)
+            if y_overlap_max - y_overlap_min > 0.02:
+                door_x = bb.x_max
+                door_y = (y_overlap_min + y_overlap_max) / 2
+
+        # Check horizontal adjacency (rooms share a horizontal wall)
+        if door_x is None:
+            if abs(ba.y_max - bb.y_min) < 0.015:
+                # A is above B
+                x_overlap_min = max(ba.x_min, bb.x_min)
+                x_overlap_max = min(ba.x_max, bb.x_max)
+                if x_overlap_max - x_overlap_min > 0.02:
+                    door_x = (x_overlap_min + x_overlap_max) / 2
+                    door_y = ba.y_max
+            elif abs(bb.y_max - ba.y_min) < 0.015:
+                # B is above A
+                x_overlap_min = max(ba.x_min, bb.x_min)
+                x_overlap_max = min(ba.x_max, bb.x_max)
+                if x_overlap_max - x_overlap_min > 0.02:
+                    door_x = (x_overlap_min + x_overlap_max) / 2
+                    door_y = bb.y_max
+
+        if door_x is not None and door_y is not None:
+            door_map[edge.room_a_id].append((door_x, door_y))
+            door_map[edge.room_b_id].append((door_x, door_y))
+
+    # Rebuild rooms with door midpoints
+    result = []
+    for room in placed:
+        doors = door_map.get(room.room_spec.room_id, [])
+        result.append(RoomLayout(
+            room_spec=room.room_spec,
+            bbox=room.bbox,
+            door_midpoints=doors,
+        ))
+
+    return result
+
+
+def _improve_adjacency_by_swapping(
+    rooms: list[RoomLayout],
+    edges: list[AdjacencyEdge],
+    plot_width: float,
+    plot_height: float,
+    max_passes: int = 2,
+) -> list[RoomLayout]:
+    """Greedily swap room assignments to improve required adjacency satisfaction.
+
+    This keeps the same treemap boxes (gap-free) and only reassigns which room
+    occupies each box. Room IDs travel with their RoomSpec, so edge checks remain valid.
+    """
+    required_edges = [e for e in edges if e.required]
+    if len(rooms) < 3 or not required_edges:
+        return rooms
+
+    # Work on a mutable copy.
+    current = [
+        RoomLayout(
+            room_spec=r.room_spec,
+            bbox=r.bbox,
+            door_midpoints=r.door_midpoints,
+        )
+        for r in rooms
+    ]
+
+    def score(room_list: list[RoomLayout]) -> float:
+        room_map = {r.room_spec.room_id: r.bbox for r in room_list}
+        satisfied = 0
+        for edge in required_edges:
+            ba = room_map.get(edge.room_a_id)
+            bb = room_map.get(edge.room_b_id)
+            if ba is None or bb is None:
+                continue
+
+            shared_wall = 0.0
+            # Touching on x-axis.
+            if abs(ba.x_max - bb.x_min) < 0.01 or abs(bb.x_max - ba.x_min) < 0.01:
+                y_overlap = max(0, min(ba.y_max, bb.y_max) - max(ba.y_min, bb.y_min)) * plot_height
+                shared_wall = max(shared_wall, y_overlap)
+            # Touching on y-axis.
+            if abs(ba.y_max - bb.y_min) < 0.01 or abs(bb.y_max - ba.y_min) < 0.01:
+                x_overlap = max(0, min(ba.x_max, bb.x_max) - max(ba.x_min, bb.x_min)) * plot_width
+                shared_wall = max(shared_wall, x_overlap)
+            if shared_wall >= 0.9:
+                satisfied += 1
+        return satisfied / len(required_edges)
+
+    best_score = score(current)
+    n = len(current)
+
+    for _ in range(max_passes):
+        improved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                trial = list(current)
+                ri = trial[i]
+                rj = trial[j]
+                trial[i] = RoomLayout(
+                    room_spec=rj.room_spec,
+                    bbox=ri.bbox,
+                    door_midpoints=ri.door_midpoints,
+                )
+                trial[j] = RoomLayout(
+                    room_spec=ri.room_spec,
+                    bbox=rj.bbox,
+                    door_midpoints=rj.door_midpoints,
+                )
+
+                trial_score = score(trial)
+                if trial_score > best_score:
+                    current = trial
+                    best_score = trial_score
+                    improved = True
+                    if best_score >= 1.0:
+                        return current
+        if not improved:
+            break
+
+    return current
 
 
 def _treemap_subdivide(
