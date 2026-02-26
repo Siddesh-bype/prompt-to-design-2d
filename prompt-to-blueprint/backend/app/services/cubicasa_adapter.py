@@ -1,22 +1,24 @@
 """
-CubiCasa5K Adapter — Converts CubiCasa5K SVG annotations to our LayoutGraph format.
+CubiCasa5K Adapter — Converts CubiCasa5K annotations to our LayoutGraph format.
 
-CubiCasa5K structure (after extraction):
-    data/
-    ├── train.txt / val.txt / test.txt   (sample paths, one per line)
-    └── cubicasa5k/
-        └── <sample_id>/
-            ├── F1_original.png          (floor plan image)
-            └── model.svg                (polygon annotations)
+Supports two data formats:
+1. COCO JSON (cubicasa5k_coco/) — fast, pre-processed bounding boxes (preferred)
+2. SVG annotations (cubicasa5k/) — slower, parses polygon annotations
 
-The SVG contains <polygon> elements with class attributes indicating room type
-(e.g., "Kitchen", "LivingRoom", "Bedroom", "Bath", "Hallway", etc.)
+COCO structure:
+    data/cubicasa5k_coco/
+    ├── train_coco_pt.json   (4200 images, 49K room annotations)
+    ├── val_coco_pt.json
+    └── test_coco_pt.json
 """
 
 from __future__ import annotations
 
+import glob
+import json
 import logging
 import os
+import random
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -36,219 +38,148 @@ from app.models.schemas import (
 
 logger = logging.getLogger(__name__)
 
-# ─── Category Mapping ────────────────────────────────────────────────────────
+# ─── Room Types for random assignment ────────────────────────────────────────
 
-# Map CubiCasa5K SVG class names → our RoomType enum
-CUBICASA_ROOM_MAP: dict[str, RoomType] = {
-    # Exact class matches
-    "Kitchen": RoomType.KITCHEN,
-    "LivingRoom": RoomType.LIVING_ROOM,
-    "Bedroom": RoomType.BEDROOM,
-    "Bath": RoomType.BATHROOM,
-    "Bathroom": RoomType.BATHROOM,
-    "Toilet": RoomType.TOILET,
-    "Hallway": RoomType.CORRIDOR,
-    "Corridor": RoomType.CORRIDOR,
-    "Storage": RoomType.UTILITY,
-    "Closet": RoomType.UTILITY,
-    "Garage": RoomType.GARAGE,
-    "Balcony": RoomType.BALCONY,
-    "Terrace": RoomType.BALCONY,
-    "Dining": RoomType.DINING,
-    "DiningRoom": RoomType.DINING,
-    "Study": RoomType.STUDY,
-    "Office": RoomType.STUDY,
-    "Railing": RoomType.BALCONY,
-    "Outdoor": RoomType.BALCONY,
-    # Fallback for unrecognised categories
-    "Room": RoomType.BEDROOM,
-    "OtherRoom": RoomType.UTILITY,
-    "Undefined": RoomType.UTILITY,
-}
+MAIN_ROOM_TYPES = [
+    RoomType.LIVING_ROOM, RoomType.BEDROOM, RoomType.KITCHEN,
+    RoomType.BATHROOM, RoomType.MASTER_BEDROOM, RoomType.DINING,
+    RoomType.STUDY, RoomType.CORRIDOR, RoomType.UTILITY, RoomType.BALCONY,
+]
 
 
-def _map_room_type(cubicasa_class: str) -> RoomType:
-    """Map a CubiCasa class name to our RoomType enum."""
-    # Try exact match first
-    if cubicasa_class in CUBICASA_ROOM_MAP:
-        return CUBICASA_ROOM_MAP[cubicasa_class]
+def _assign_room_types(n_rooms: int, seed: int = 0) -> list[RoomType]:
+    """Assign plausible room types to rooms based on count."""
+    rng = random.Random(seed)
 
-    # Try case-insensitive partial match
-    lower = cubicasa_class.lower()
-    for key, room_type in CUBICASA_ROOM_MAP.items():
-        if key.lower() in lower:
-            return room_type
+    if n_rooms <= 2:
+        return [RoomType.LIVING_ROOM, RoomType.BEDROOM][:n_rooms]
 
-    # Default fallback
-    return RoomType.UTILITY
+    # Always include at least: living, kitchen, bathroom
+    types = [RoomType.LIVING_ROOM, RoomType.KITCHEN, RoomType.BATHROOM]
 
+    # Add bedrooms
+    n_bedrooms = max(1, n_rooms // 3)
+    if n_bedrooms >= 1:
+        types.append(RoomType.MASTER_BEDROOM)
+    for _ in range(n_bedrooms - 1):
+        types.append(RoomType.BEDROOM)
 
-# ─── SVG Polygon Extraction ─────────────────────────────────────────────────
+    # Fill remaining with random types
+    fill_types = [RoomType.DINING, RoomType.STUDY, RoomType.CORRIDOR,
+                  RoomType.UTILITY, RoomType.BALCONY, RoomType.BATHROOM]
+    while len(types) < n_rooms:
+        types.append(rng.choice(fill_types))
 
-# Namespace for SVG
-SVG_NS = {"svg": "http://www.w3.org/2000/svg"}
-
-
-def _parse_polygon_points(points_str: str) -> list[tuple[float, float]]:
-    """Parse SVG polygon points attribute.
-
-    Formats: "x1,y1 x2,y2 ..." or "x1 y1 x2 y2 ..."
-    """
-    points = []
-    # Handle both comma-separated and space-separated
-    tokens = re.split(r'[\s,]+', points_str.strip())
-
-    for i in range(0, len(tokens) - 1, 2):
-        try:
-            x = float(tokens[i])
-            y = float(tokens[i + 1])
-            points.append((x, y))
-        except (ValueError, IndexError):
-            continue
-
-    return points
+    # Truncate if too many
+    types = types[:n_rooms]
+    rng.shuffle(types)
+    return types
 
 
-def _polygon_to_bbox(points: list[tuple[float, float]]) -> tuple[float, float, float, float]:
-    """Convert polygon points to bounding box (x_min, y_min, x_max, y_max)."""
-    if not points:
-        return (0, 0, 0, 0)
-
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    return (min(xs), min(ys), max(xs), max(ys))
+# ─── COCO JSON Loading ──────────────────────────────────────────────────────
 
 
-def _polygon_area(points: list[tuple[float, float]]) -> float:
-    """Calculate polygon area using shoelace formula."""
-    n = len(points)
-    if n < 3:
-        return 0.0
-
-    area = 0.0
-    for i in range(n):
-        j = (i + 1) % n
-        area += points[i][0] * points[j][1]
-        area -= points[j][0] * points[i][1]
-
-    return abs(area) / 2.0
-
-
-# ─── SVG Parsing ─────────────────────────────────────────────────────────────
-
-
-def parse_cubicasa_svg(svg_path: str) -> Optional[dict]:
-    """Parse a single CubiCasa5K model.svg file.
+def _load_coco_format(
+    coco_dir: str,
+    split: str = "train",
+    max_samples: int | None = None,
+) -> list[dict]:
+    """Load CubiCasa5K from COCO JSON annotations (fast path).
 
     Args:
-        svg_path: Path to the model.svg annotation file
+        coco_dir: Path to cubicasa5k_coco directory
+        split: One of 'train', 'val', 'test'
+        max_samples: Max number of floor plans to load
 
     Returns:
-        Dict with parsed_layout and layout_graph, or None if parsing fails
+        List of dicts with parsed_layout and layout_graph keys
     """
-    try:
-        tree = ET.parse(svg_path)
-        root = tree.getroot()
-    except ET.ParseError as e:
-        logger.warning(f"Failed to parse SVG {svg_path}: {e}")
+    json_file = os.path.join(coco_dir, f"{split}_coco_pt.json")
+    if not os.path.exists(json_file):
+        logger.warning(f"COCO JSON not found: {json_file}")
+        return []
+
+    logger.info(f"Loading CubiCasa5K from COCO JSON: {json_file}")
+    with open(json_file, "r") as f:
+        coco_data = json.load(f)
+
+    images = coco_data.get("images", [])
+    annotations = coco_data.get("annotations", [])
+
+    # Group annotations by image_id
+    img_annots: dict[int, list] = {}
+    for ann in annotations:
+        if ann.get("category_id") == 2:  # room annotations only
+            img_id = ann["image_id"]
+            img_annots.setdefault(img_id, []).append(ann)
+
+    # Build image dimension lookup
+    img_dims = {img["id"]: (img["width"], img["height"]) for img in images}
+
+    if max_samples and len(img_annots) > max_samples:
+        selected_ids = random.sample(list(img_annots.keys()), max_samples)
+        img_annots = {k: img_annots[k] for k in selected_ids}
+
+    samples = []
+    errors = 0
+
+    for img_id, room_anns in img_annots.items():
+        try:
+            sample = _coco_image_to_sample(img_id, room_anns, img_dims)
+            if sample:
+                samples.append(sample)
+            else:
+                errors += 1
+        except Exception as e:
+            errors += 1
+            continue
+
+    logger.info(f"CubiCasa5K COCO: Loaded {len(samples)} floor plans from {split} ({errors} errors)")
+    return samples
+
+
+def _coco_image_to_sample(
+    img_id: int,
+    room_anns: list[dict],
+    img_dims: dict[int, tuple[int, int]],
+) -> dict | None:
+    """Convert COCO annotations for one image to our format."""
+    if len(room_anns) < 2:
         return None
 
-    # Collect all room polygons
-    rooms_data = []
+    # Cap rooms at 30
+    if len(room_anns) > 30:
+        room_anns.sort(key=lambda a: a.get("area", 0), reverse=True)
+        room_anns = room_anns[:30]
 
-    # Search for polygon/polyline elements with class/id attributes
-    for elem in root.iter():
-        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+    w, h = img_dims.get(img_id, (1000, 1000))
+    scale = max(w, h, 1)
 
-        if tag not in ("polygon", "polyline", "path", "rect"):
-            continue
+    # Assign room types
+    room_types = _assign_room_types(len(room_anns), seed=img_id)
 
-        # Get room class from class attribute, id, or parent group
-        room_class = (
-            elem.get("class", "")
-            or elem.get("id", "")
-            or _get_parent_class(root, elem)
-        )
-
-        if not room_class:
-            continue
-
-        # Skip non-room elements (walls, doors, windows, icons)
-        skip_classes = {"Wall", "wall", "Window", "window", "Door", "door",
-                        "Icon", "icon", "Stair", "stair", "Separator", "separator"}
-        if any(s in room_class for s in skip_classes):
-            continue
-
-        # Get polygon points
-        points = []
-        if tag == "polygon" or tag == "polyline":
-            points_str = elem.get("points", "")
-            if points_str:
-                points = _parse_polygon_points(points_str)
-        elif tag == "rect":
-            x = float(elem.get("x", 0))
-            y = float(elem.get("y", 0))
-            w = float(elem.get("width", 0))
-            h = float(elem.get("height", 0))
-            points = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-
-        if len(points) < 3:
-            continue
-
-        # Get room type
-        # Extract first relevant class name token
-        class_token = room_class.split()[0].strip()
-        room_type = _map_room_type(class_token)
-
-        area = _polygon_area(points)
-        bbox = _polygon_to_bbox(points)
-
-        if area < 1.0:  # Skip tiny elements
-            continue
-
-        rooms_data.append({
-            "room_type": room_type,
-            "points": points,
-            "bbox": bbox,
-            "area": area,
-            "class": class_token,
-        })
-
-    if not rooms_data:
-        return None
-
-    # Compute normalisation bounds (full drawing bounds)
-    all_xs = [p[0] for r in rooms_data for p in r["points"]]
-    all_ys = [p[1] for r in rooms_data for p in r["points"]]
-    global_x_min, global_x_max = min(all_xs), max(all_xs)
-    global_y_min, global_y_max = min(all_ys), max(all_ys)
-    w_range = max(global_x_max - global_x_min, 1e-6)
-    h_range = max(global_y_max - global_y_min, 1e-6)
-
-    # Total plot area estimate (using drawing bounds)
-    # Assume 1 SVG unit ≈ 1cm, so convert to m²
-    plot_area_sqm = (w_range * h_range) / 10000.0  # cm² → m²
-    plot_area_sqm = max(plot_area_sqm, 30.0)  # Minimum 30 m²
-
-    # Build RoomSpecs and RoomLayouts
     room_specs = []
     room_layouts = []
 
-    # Track master bedroom (largest bedroom)
-    bedroom_sizes = [(i, r["area"]) for i, r in enumerate(rooms_data)
-                     if r["room_type"] in (RoomType.BEDROOM, RoomType.MASTER_BEDROOM)]
-    master_idx = max(bedroom_sizes, key=lambda x: x[1])[0] if bedroom_sizes else -1
+    for i, ann in enumerate(room_anns):
+        # COCO bbox: [x, y, width, height]
+        bx, by, bw, bh = ann["bbox"]
 
-    for i, room in enumerate(rooms_data):
-        room_type = room["room_type"]
+        # Normalise to [0, 1]
+        x_min = max(0.0, bx / w)
+        y_min = max(0.0, by / h)
+        x_max = min(1.0, (bx + bw) / w)
+        y_max = min(1.0, (by + bh) / h)
 
-        # Promote largest bedroom to master
-        if i == master_idx:
-            room_type = RoomType.MASTER_BEDROOM
+        # Skip tiny rooms
+        if (x_max - x_min) < 0.01 or (y_max - y_min) < 0.01:
+            continue
 
-        # Convert area from SVG units to m²
-        area_sqm = room["area"] / 10000.0  # cm² → m²
-        area_sqm = max(area_sqm, 3.0)  # Minimum 3 m²
+        # Estimate area in m² (assume image ≈ 200m² plot)
+        area_frac = (x_max - x_min) * (y_max - y_min)
+        area_sqm = max(4.0, min(area_frac * 200.0, 200.0))
+
+        room_type = room_types[i] if i < len(room_types) else RoomType.UTILITY
 
         spec = RoomSpec(
             room_id=f"room_{i + 1}",
@@ -257,33 +188,39 @@ def parse_cubicasa_svg(svg_path: str) -> Optional[dict]:
         )
         room_specs.append(spec)
 
-        # Normalise bounding box to [0,1]
-        x_min, y_min, x_max, y_max = room["bbox"]
-        bbox = BoundingBox(
-            x_min=max(0, (x_min - global_x_min) / w_range),
-            y_min=max(0, (y_min - global_y_min) / h_range),
-            x_max=min(1, (x_max - global_x_min) / w_range),
-            y_max=min(1, (y_max - global_y_min) / h_range),
-        )
+        try:
+            room_layouts.append(RoomLayout(
+                room_spec=spec,
+                bbox=BoundingBox(
+                    x_min=round(x_min, 6),
+                    y_min=round(y_min, 6),
+                    x_max=round(x_max, 6),
+                    y_max=round(y_max, 6),
+                ),
+            ))
+        except Exception:
+            continue
 
-        room_layouts.append(RoomLayout(room_spec=spec, bbox=bbox))
+    if len(room_layouts) < 2:
+        return None
 
-    # Infer adjacency edges (rooms with overlapping/touching bounding boxes)
+    # Infer adjacency
     adjacency_edges = _infer_adjacency(room_layouts)
 
+    plot_area_sqm = max(30.0, min(sum(s.target_area_sqm for s in room_specs) * 1.2, 2000.0))
+
     parsed = ParsedLayout(
-        rooms=room_specs,
+        rooms=room_specs[:len(room_layouts)],
         plot_area_sqm=round(plot_area_sqm, 1),
-        facing=CompassFacing.NORTH,
+        facing=random.choice(list(CompassFacing)),
         adjacency_constraints=adjacency_edges,
-        vastu_enabled=False,
     )
 
     layout_graph = LayoutGraph(
         rooms=room_layouts,
         adjacency_edges=adjacency_edges,
         plot_area_sqm=round(plot_area_sqm, 1),
-        facing=CompassFacing.NORTH,
+        facing=parsed.facing,
         generation_mode="heuristic",
     )
 
@@ -293,14 +230,7 @@ def parse_cubicasa_svg(svg_path: str) -> Optional[dict]:
     }
 
 
-def _get_parent_class(root: ET.Element, elem: ET.Element) -> str:
-    """Try to get class from parent <g> element."""
-    # Build parent map
-    parent_map = {child: parent for parent in root.iter() for child in parent}
-    parent = parent_map.get(elem)
-    if parent is not None:
-        return parent.get("class", "") or parent.get("id", "")
-    return ""
+# ─── Adjacency Inference ────────────────────────────────────────────────────
 
 
 def _infer_adjacency(rooms: list[RoomLayout], threshold: float = 0.02) -> list[AdjacencyEdge]:
@@ -312,20 +242,15 @@ def _infer_adjacency(rooms: list[RoomLayout], threshold: float = 0.02) -> list[A
             bi = rooms[i].bbox
             bj = rooms[j].bbox
 
-            # Check if bounding boxes overlap or are within threshold
             h_overlap = min(bi.x_max, bj.x_max) - max(bi.x_min, bj.x_min)
             v_overlap = min(bi.y_max, bj.y_max) - max(bi.y_min, bj.y_min)
 
-            # Adjacent if they share a wall (overlap in one dimension, touching in other)
             h_adjacent = h_overlap > threshold and abs(bi.y_max - bj.y_min) < threshold
             v_adjacent = v_overlap > threshold and abs(bi.x_max - bj.x_min) < threshold
-
-            # Or overlapping
             overlapping = h_overlap > threshold and v_overlap > threshold
 
             if h_adjacent or v_adjacent or overlapping:
                 conn = ConnectionType.DOOR
-                # Kitchen/dining → OPENING
                 types = {rooms[i].room_spec.room_type, rooms[j].room_spec.room_type}
                 if types & {RoomType.KITCHEN, RoomType.DINING, RoomType.LIVING_ROOM}:
                     conn = ConnectionType.OPENING
@@ -340,7 +265,7 @@ def _infer_adjacency(rooms: list[RoomLayout], threshold: float = 0.02) -> list[A
     return edges
 
 
-# ─── Batch Loading ───────────────────────────────────────────────────────────
+# ─── Batch Loading (Main Entry Point) ───────────────────────────────────────
 
 
 def load_cubicasa_dataset(
@@ -348,45 +273,175 @@ def load_cubicasa_dataset(
     split: str = "train",
     max_samples: int | None = None,
 ) -> list[dict]:
-    """Load CubiCasa5K dataset for a given split.
+    """Load CubiCasa5K dataset — uses COCO JSON if available, falls back to SVG.
 
     Args:
-        data_dir: Path to extracted CubiCasa5K root (containing cubicasa5k/ and txt files)
+        data_dir: Path to CubiCasa5K root directory
         split: One of 'train', 'val', 'test'
-        max_samples: Optional max number of samples to load
+        max_samples: Optional max number of samples
 
     Returns:
         List of dicts with parsed_layout and layout_graph keys
     """
+    # Prefer COCO JSON format (much faster)
+    coco_dir = os.path.join(data_dir, "..", "cubicasa5k_coco")
+    if not os.path.exists(coco_dir):
+        coco_dir = os.path.join(data_dir, "cubicasa5k_coco")
+
+    # Also check sibling directory
+    parent = os.path.dirname(data_dir)
+    for candidate in [
+        os.path.join(parent, "cubicasa5k_coco"),
+        os.path.join(data_dir, "cubicasa5k_coco"),
+        coco_dir,
+    ]:
+        if os.path.exists(candidate):
+            coco_dir = candidate
+            break
+
+    coco_json = os.path.join(coco_dir, f"{split}_coco_pt.json")
+    if os.path.exists(coco_json):
+        return _load_coco_format(coco_dir, split, max_samples)
+
+    # Fallback: SVG parsing (slower)
+    logger.info(f"COCO JSON not found, falling back to SVG parsing")
+    return _load_svg_format(data_dir, split, max_samples)
+
+
+def _load_svg_format(
+    data_dir: str,
+    split: str = "train",
+    max_samples: int | None = None,
+) -> list[dict]:
+    """Fallback: load from SVG model files."""
+    svg_paths = []
+
     split_file = os.path.join(data_dir, f"{split}.txt")
+    if os.path.exists(split_file):
+        with open(split_file, "r") as f:
+            sample_paths = [line.strip() for line in f if line.strip()]
+        for sp in sample_paths:
+            svg = os.path.join(data_dir, sp, "model.svg")
+            if not os.path.exists(svg):
+                svg = os.path.join(data_dir, "cubicasa5k", sp, "model.svg")
+            if os.path.exists(svg):
+                svg_paths.append(svg)
+    else:
+        # Glob fallback
+        for search in [os.path.join(data_dir, "cubicasa5k"), data_dir]:
+            found = glob.glob(os.path.join(search, "**", "model.svg"), recursive=True)
+            if found:
+                svg_paths = sorted(set(found))
+                break
 
-    if not os.path.exists(split_file):
-        logger.error(f"Split file not found: {split_file}")
-        return []
-
-    # Read sample paths
-    with open(split_file, "r") as f:
-        sample_paths = [line.strip() for line in f if line.strip()]
+        if svg_paths:
+            svg_paths.sort()
+            n = len(svg_paths)
+            if split == "train":
+                svg_paths = svg_paths[:int(n * 0.8)]
+            elif split == "val":
+                svg_paths = svg_paths[int(n * 0.8):int(n * 0.9)]
+            elif split == "test":
+                svg_paths = svg_paths[int(n * 0.9):]
 
     if max_samples:
-        sample_paths = sample_paths[:max_samples]
+        svg_paths = svg_paths[:max_samples]
 
     samples = []
-    for sample_path in sample_paths:
-        # CubiCasa format: each line is a relative path to sample directory
-        svg_path = os.path.join(data_dir, sample_path, "model.svg")
-
-        if not os.path.exists(svg_path):
-            # Try alternative path structure
-            svg_path = os.path.join(data_dir, "cubicasa5k", sample_path, "model.svg")
-
-        if not os.path.exists(svg_path):
-            logger.debug(f"SVG not found: {svg_path}")
-            continue
-
-        result = parse_cubicasa_svg(svg_path)
+    for svg_path in svg_paths:
+        result = _parse_svg(svg_path)
         if result and len(result["layout_graph"]["rooms"]) >= 2:
             samples.append(result)
 
-    logger.info(f"Loaded {len(samples)} CubiCasa5K samples from {split} split")
+    logger.info(f"CubiCasa5K SVG: Loaded {len(samples)} samples from {split}")
     return samples
+
+
+def _parse_svg(svg_path: str) -> dict | None:
+    """Parse a single CubiCasa SVG file (simplified)."""
+    try:
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+    except ET.ParseError:
+        return None
+
+    rooms_data = []
+    for elem in root.iter():
+        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if tag not in ("polygon", "polyline", "rect"):
+            continue
+
+        room_class = elem.get("class", "") or elem.get("id", "")
+        if not room_class:
+            continue
+
+        skip = {"Wall", "wall", "Window", "window", "Door", "door", "Icon", "icon", "Stair", "stair"}
+        if any(s in room_class for s in skip):
+            continue
+
+        points = []
+        if tag in ("polygon", "polyline"):
+            pts = elem.get("points", "")
+            tokens = re.split(r'[\s,]+', pts.strip())
+            for k in range(0, len(tokens) - 1, 2):
+                try:
+                    points.append((float(tokens[k]), float(tokens[k+1])))
+                except ValueError:
+                    continue
+        elif tag == "rect":
+            x, y = float(elem.get("x", 0)), float(elem.get("y", 0))
+            w, h = float(elem.get("width", 0)), float(elem.get("height", 0))
+            points = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
+
+        if len(points) < 3:
+            continue
+
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        area = abs(sum(points[i][0]*points[(i+1)%len(points)][1] - points[(i+1)%len(points)][0]*points[i][1] for i in range(len(points)))) / 2
+        if area < 1.0:
+            continue
+
+        rooms_data.append({"bbox": (min(xs), min(ys), max(xs), max(ys)), "area": area})
+
+    if len(rooms_data) < 2:
+        return None
+
+    if len(rooms_data) > 30:
+        rooms_data.sort(key=lambda r: r["area"], reverse=True)
+        rooms_data = rooms_data[:30]
+
+    # Normalise and build
+    all_x = [r["bbox"][0] for r in rooms_data] + [r["bbox"][2] for r in rooms_data]
+    all_y = [r["bbox"][1] for r in rooms_data] + [r["bbox"][3] for r in rooms_data]
+    gx, gy, gX, gY = min(all_x), min(all_y), max(all_x), max(all_y)
+    wr, hr = max(gX - gx, 1e-6), max(gY - gy, 1e-6)
+
+    room_types = _assign_room_types(len(rooms_data))
+    room_specs, room_layouts = [], []
+
+    for i, room in enumerate(rooms_data):
+        area_sqm = max(4.0, min(room["area"] / 10000.0, 200.0))
+        spec = RoomSpec(room_id=f"room_{i+1}", room_type=room_types[i], target_area_sqm=round(area_sqm, 1))
+        room_specs.append(spec)
+        x0, y0, x1, y1 = room["bbox"]
+        try:
+            room_layouts.append(RoomLayout(room_spec=spec, bbox=BoundingBox(
+                x_min=round(max(0, (x0-gx)/wr), 6), y_min=round(max(0, (y0-gy)/hr), 6),
+                x_max=round(min(1, (x1-gx)/wr), 6), y_max=round(min(1, (y1-gy)/hr), 6),
+            )))
+        except Exception:
+            continue
+
+    if len(room_layouts) < 2:
+        return None
+
+    adj = _infer_adjacency(room_layouts)
+    pa = max(30.0, min(sum(s.target_area_sqm for s in room_specs) * 1.2, 2000.0))
+    facing = random.choice(list(CompassFacing))
+
+    parsed = ParsedLayout(rooms=room_specs[:len(room_layouts)], plot_area_sqm=round(pa, 1),
+                          facing=facing, adjacency_constraints=adj)
+    lg = LayoutGraph(rooms=room_layouts, adjacency_edges=adj, plot_area_sqm=round(pa, 1),
+                     facing=facing, generation_mode="heuristic")
+    return {"parsed_layout": parsed.model_dump(), "layout_graph": lg.model_dump()}

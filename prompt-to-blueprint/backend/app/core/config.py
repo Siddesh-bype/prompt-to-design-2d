@@ -13,23 +13,30 @@ class Settings(BaseSettings):
     secret_key: str = "change-me-in-production"
     debug: bool = True
 
-    # --- Redis ---
-    redis_url: str = "redis://localhost:6379/0"
+    # --- NLP Provider ---
+    nlp_provider: str = "claude"  # "claude" or "openrouter"
 
-    # --- Ollama ---
-    ollama_host: str = "http://localhost:11434"
-    ollama_model: str = "qwen2.5:1.5b"
-    ollama_timeout: int = 30
+    # --- Claude API (primary) ---
+    anthropic_api_key: str = ""
+    claude_model: str = "claude-haiku-4-5-20251001"
+    claude_max_tokens: int = 2048
+    claude_timeout: int = 30
+
+    # --- OpenRouter (backup) ---
+    openrouter_api_key: str = ""
+    openrouter_model: str = "openai/gpt-oss-120b:free"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_timeout: int = 30
 
     # --- Model Paths ---
     gnn_model_path: str = "models/floorplan_gnn.pt"
     gnn_checkpoint_dir: str = "models/"
 
-    # --- Worker ---
-    rq_queue_name: str = "layout"
-    job_ttl: int = 86400
-
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {
+        "env_file": ("../.env", ".env"),
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+    }
 
 
 # Singleton settings instance

@@ -35,15 +35,15 @@ BHK_TEMPLATES = {
         (RoomType.LIVING_ROOM, 18, 25),
         (RoomType.BEDROOM, 10, 16),
         (RoomType.KITCHEN, 6, 10),
-        (RoomType.BATHROOM, 3, 6),
+        (RoomType.BATHROOM, 4, 6),
     ],
     2: [
         (RoomType.LIVING_ROOM, 20, 30),
         (RoomType.MASTER_BEDROOM, 14, 22),
         (RoomType.BEDROOM, 10, 16),
         (RoomType.KITCHEN, 8, 12),
-        (RoomType.BATHROOM, 3, 6),
-        (RoomType.BATHROOM, 3, 5),
+        (RoomType.BATHROOM, 4, 6),
+        (RoomType.BATHROOM, 4, 6),
     ],
     3: [
         (RoomType.LIVING_ROOM, 22, 35),
@@ -52,7 +52,7 @@ BHK_TEMPLATES = {
         (RoomType.BEDROOM, 10, 16),
         (RoomType.KITCHEN, 8, 14),
         (RoomType.BATHROOM, 4, 7),
-        (RoomType.BATHROOM, 3, 6),
+        (RoomType.BATHROOM, 4, 6),
     ],
     4: [
         (RoomType.LIVING_ROOM, 25, 40),
@@ -62,18 +62,18 @@ BHK_TEMPLATES = {
         (RoomType.BEDROOM, 10, 16),
         (RoomType.KITCHEN, 10, 16),
         (RoomType.BATHROOM, 4, 7),
-        (RoomType.BATHROOM, 3, 6),
-        (RoomType.BATHROOM, 3, 5),
+        (RoomType.BATHROOM, 4, 6),
+        (RoomType.BATHROOM, 4, 6),
     ],
 }
 
 # Optional extra rooms
 OPTIONAL_ROOMS = [
-    (RoomType.BALCONY, 3, 8),
+    (RoomType.BALCONY, 4, 8),
     (RoomType.STUDY, 6, 12),
     (RoomType.DINING, 8, 14),
-    (RoomType.CORRIDOR, 3, 6),
-    (RoomType.UTILITY, 3, 6),
+    (RoomType.CORRIDOR, 4, 6),
+    (RoomType.UTILITY, 4, 6),
 ]
 
 
@@ -192,22 +192,22 @@ def _generate_adjacencies(rooms: list[RoomSpec]) -> list[AdjacencyEdge]:
 
 
 def _generate_ground_truth(parsed: ParsedLayout) -> LayoutGraph:
-    """Generate ground-truth bounding boxes using strip-packing."""
+    """Generate ground-truth bounding boxes using strip-packing.
+
+    Works in absolute metre coords then normalises to [0,1] at the end.
+    Falls back to a uniform grid if any room fails validation.
+    """
     plot_side = math.sqrt(parsed.plot_area_sqm)
-    rooms = []
+    rooms_raw: list[tuple] = []  # (room_spec, x_min_m, y_min_m, x_max_m, y_max_m)
     cursor_x, cursor_y, row_height = 0.0, 0.0, 0.0
 
     for room_spec in parsed.rooms:
         area = room_spec.target_area_sqm
-        aspect = random.uniform(0.8, 1.5)
-        h = math.sqrt(area / aspect)
-        w = area / h
+        aspect = random.uniform(0.7, 1.8)
+        h = math.sqrt(max(area / aspect, 0.01))
+        w = max(area / h, 0.01)
 
-        # Add jitter
-        w *= random.uniform(0.9, 1.1)
-        h *= random.uniform(0.9, 1.1)
-
-        # Minimum dimension
+        # Clamp dimensions — no jitter that could cause negatives
         w = max(w, 2.4)
         h = max(h, 2.4)
 
@@ -216,23 +216,58 @@ def _generate_ground_truth(parsed: ParsedLayout) -> LayoutGraph:
             cursor_y += row_height
             row_height = 0.0
 
-        x_min = cursor_x / plot_side
-        y_min = cursor_y / plot_side
-        x_max = min((cursor_x + w) / plot_side, 1.0)
-        y_max = min((cursor_y + h) / plot_side, 1.0)
+        if cursor_y >= plot_side:
+            cursor_x += w
+            row_height = max(row_height, h)
+            continue
 
-        rooms.append(RoomLayout(
-            room_spec=room_spec,
-            bbox=BoundingBox(
-                x_min=max(0, x_min),
-                y_min=max(0, y_min),
-                x_max=min(1, x_max),
-                y_max=min(1, y_max),
-            ),
-        ))
+        x0 = cursor_x
+        y0 = cursor_y
+        x1 = min(cursor_x + w, plot_side)
+        y1 = min(cursor_y + h, plot_side)
+
+        if x1 > x0 and y1 > y0:
+            rooms_raw.append((room_spec, x0, y0, x1, y1))
 
         cursor_x += w
         row_height = max(row_height, h)
+
+    # Fallback grid
+    if len(rooms_raw) < 2:
+        rooms_raw = []
+        n = len(parsed.rooms)
+        cols = max(2, math.ceil(math.sqrt(n)))
+        rows_count = math.ceil(n / cols)
+        cell_w = plot_side / cols
+        cell_h = plot_side / rows_count
+        for i, room_spec in enumerate(parsed.rooms):
+            r = i // cols
+            c = i % cols
+            rooms_raw.append((room_spec, c * cell_w, r * cell_h,
+                              (c + 1) * cell_w, (r + 1) * cell_h))
+
+    # Normalise to [0, 1]
+    rooms = []
+    s = max(plot_side, 1e-6)
+    for room_spec, x0, y0, x1, y1 in rooms_raw:
+        nx0 = max(0.0, min(1.0, x0 / s))
+        ny0 = max(0.0, min(1.0, y0 / s))
+        nx1 = max(0.0, min(1.0, x1 / s))
+        ny1 = max(0.0, min(1.0, y1 / s))
+        if nx1 <= nx0 or ny1 <= ny0:
+            continue
+        try:
+            rooms.append(RoomLayout(
+                room_spec=room_spec,
+                bbox=BoundingBox(
+                    x_min=round(nx0, 6),
+                    y_min=round(ny0, 6),
+                    x_max=round(nx1, 6),
+                    y_max=round(ny1, 6),
+                ),
+            ))
+        except Exception:
+            pass
 
     return LayoutGraph(
         rooms=rooms,

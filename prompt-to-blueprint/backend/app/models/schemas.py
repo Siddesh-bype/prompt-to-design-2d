@@ -58,8 +58,8 @@ class RoomSpec(BaseModel):
     room_id: str = Field(..., description="Unique identifier for the room")
     room_type: RoomType = Field(..., description="Type of room")
     target_area_sqm: float = Field(
-        ..., ge=4.0, le=80.0,
-        description="Target area in square metres (4.0–80.0)"
+        ..., ge=4.0, le=200.0,
+        description="Target area in square metres (4.0–200.0)"
     )
     compass_preference: Optional[CompassFacing] = Field(
         None, description="Preferred compass direction for this room"
@@ -84,12 +84,12 @@ class AdjacencyEdge(BaseModel):
 class ParsedLayout(BaseModel):
     """Output of the NLP parser — structured floor plan specification."""
     rooms: list[RoomSpec] = Field(
-        ..., min_length=2, max_length=12,
-        description="List of room specifications (2–12 rooms)"
+        ..., min_length=2, max_length=30,
+        description="List of room specifications (2–30 rooms)"
     )
     plot_area_sqm: float = Field(
-        ..., ge=30.0, le=500.0,
-        description="Total plot area in square metres (30.0–500.0)"
+        ..., ge=30.0, le=2000.0,
+        description="Total plot area in square metres (30.0–2000.0)"
     )
     facing: CompassFacing = Field(
         ..., description="Primary compass facing of the plot"

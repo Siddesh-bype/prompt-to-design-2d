@@ -76,9 +76,7 @@ class ModelRegistry:
         if "floorplan_gnn" in self._models:
             return self._models["floorplan_gnn"]
 
-        model_path = model_path or os.path.join(
-            settings.model_weights_path, "floorplan_gnn.pt"
-        )
+        model_path = model_path or settings.gnn_model_path
 
         model = FloorPlanGNN()
 

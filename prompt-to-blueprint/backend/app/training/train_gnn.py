@@ -138,10 +138,12 @@ def load_dataset_by_source(
 
             swiss_dir = data_dir
             if dataset == "combined":
-                swiss_dir = os.path.join(data_dir, "modified_swiss_dwellings")
+                swiss_dir = os.path.join(data_dir, "modified-swiss-dwellings-v2")
 
             # Check multiple possible paths
-            for possible_dir in [swiss_dir, os.path.join(data_dir, "modified_swiss_dwellings"),
+            for possible_dir in [swiss_dir,
+                                  os.path.join(data_dir, "modified-swiss-dwellings-v2"),
+                                  os.path.join(data_dir, "modified_swiss_dwellings"),
                                   os.path.join(data_dir, "modified-swiss-dwellings")]:
                 if os.path.exists(possible_dir):
                     swiss_dir = possible_dir
@@ -215,14 +217,25 @@ def train(
     val_samples = samples[split_idx:]
     logger.info(f"Train: {len(train_samples)}, Val: {len(val_samples)}")
 
-    # Convert to PyG data list
-    train_data = _samples_to_pyg(train_samples, device)
-    val_data = _samples_to_pyg(val_samples, device)
-
-    if not train_data:
-        raise ValueError("No valid training samples after conversion to PyG format")
+    # Convert to PyG graph list directly on CPU
+    from torch_geometric.loader import DataLoader
+    cpu_device = torch.device("cpu")
+    
+    train_data = _samples_to_pyg(train_samples, cpu_device)
+    val_data = _samples_to_pyg(val_samples, cpu_device)
+    
+    # Free heavy JSON dicts overhead to prevent memory leaks
+    del samples
+    del train_samples
+    del val_samples
+    import gc
+    gc.collect()
 
     logger.info(f"PyG conversion: train={len(train_data)}, val={len(val_data)}")
+
+    # Batched DataLoaders to fully saturate GPU VRAM and compute!
+    train_loader = DataLoader(train_data, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=128, shuffle=False)
 
     # Model
     model = FloorPlanGNN().to(device)
@@ -248,11 +261,13 @@ def train(
         model.train()
         train_losses = []
 
-        for data, gt_bboxes in train_data:
-            optimizer.zero_grad()
-            bbox_pred, door_pred = model(data.x, data.edge_index, data.edge_attr)
+        for batch in train_loader:
+            batch = batch.to(device)
 
-            losses = compute_loss(bbox_pred, gt_bboxes)
+            optimizer.zero_grad()
+            bbox_pred, door_pred = model(batch.x, batch.edge_index, batch.edge_attr)
+
+            losses = compute_loss(bbox_pred, batch.y, batch_index=getattr(batch, 'batch', None))
             losses["total"].backward()
 
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -266,9 +281,10 @@ def train(
         val_losses = []
 
         with torch.no_grad():
-            for data, gt_bboxes in val_data:
-                bbox_pred, _ = model(data.x, data.edge_index, data.edge_attr)
-                losses = compute_loss(bbox_pred, gt_bboxes)
+            for batch in val_loader:
+                batch = batch.to(device)
+                bbox_pred, _ = model(batch.x, batch.edge_index, batch.edge_attr)
+                losses = compute_loss(bbox_pred, batch.y, batch_index=getattr(batch, 'batch', None))
                 val_losses.append(losses["total"].item())
 
         avg_val = sum(val_losses) / max(len(val_losses), 1)
@@ -327,9 +343,9 @@ def _samples_to_pyg(
             ], dtype=torch.float32, device=device)
 
             if data.x.size(0) == gt_bboxes.size(0):
-                result.append((data, gt_bboxes))
+                data.y = gt_bboxes
+                result.append(data)
         except Exception as e:
-            logger.warning(f"Skipping invalid sample: {e}")
             continue
 
     return result
@@ -355,13 +371,19 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
     args = parser.parse_args()
 
-    train(
-        dataset=args.dataset,
-        data_dir=args.data_dir,
-        output_dir=args.output,
-        epochs=args.epochs,
-        lr=args.lr,
-        synthetic_samples=args.samples,
-        max_samples=args.max_per_source,
-        resume_from=args.resume,
-    )
+    try:
+        train(
+            dataset=args.dataset,
+            data_dir=args.data_dir,
+            output_dir=args.output,
+            epochs=args.epochs,
+            lr=args.lr,
+            synthetic_samples=args.samples,
+            max_samples=args.max_per_source,
+            resume_from=args.resume,
+        )
+    except Exception as e:
+        import traceback
+        logger.error(f"Training failed: {e}")
+        traceback.print_exc()
+        raise SystemExit(1)

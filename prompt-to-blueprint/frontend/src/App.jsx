@@ -1,22 +1,24 @@
 import { useState } from 'react';
 import PromptPanel from './components/PromptPanel';
 import CanvasEditor from './components/CanvasEditor';
+import ThreePreview from './components/ThreePreview';
 import VastuPanel from './components/VastuPanel';
 import ExportToolbar from './components/ExportToolbar';
 
 /**
  * App — Root application component.
  * 
- * Layout: 3-panel design
+ * Layout: 3-panel design with 2D/3D toggle
  * ┌──────────────┬─────────────────────────┬──────────────┐
- * │              │      ExportToolbar       │              │
+ * │              │  ExportToolbar [2D|3D]   │              │
  * │  PromptPanel ├─────────────────────────┤  VastuPanel  │
- * │   (320px)    │     CanvasEditor         │   (280px)    │
+ * │   (320px)    │  CanvasEditor / Three    │   (280px)    │
  * │              │     (flex-1)             │              │
  * └──────────────┴─────────────────────────┴──────────────┘
  */
 export default function App() {
     const [showVastu, setShowVastu] = useState(true);
+    const [viewMode, setViewMode] = useState('2d'); // '2d' or '3d'
 
     return (
         <div className="h-screen w-screen flex bg-surface-900 text-surface-100 overflow-hidden">
@@ -25,10 +27,10 @@ export default function App() {
                 <PromptPanel />
             </aside>
 
-            {/* Center — Toolbar + Canvas */}
+            {/* Center — Toolbar + Canvas/3D */}
             <main className="flex-1 flex flex-col min-w-0">
-                <ExportToolbar />
-                <CanvasEditor />
+                <ExportToolbar viewMode={viewMode} onViewModeChange={setViewMode} />
+                {viewMode === '3d' ? <ThreePreview /> : <CanvasEditor />}
             </main>
 
             {/* Right Panel — Vastu (collapsible) */}

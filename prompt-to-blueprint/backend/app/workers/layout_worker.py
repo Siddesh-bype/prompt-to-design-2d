@@ -1,5 +1,5 @@
 """
-Layout Worker — RQ background task for the full generation pipeline.
+Layout Worker — Background task for the full generation pipeline.
 
 Pipeline stages:
 1. NLP Parsing (0–25%)

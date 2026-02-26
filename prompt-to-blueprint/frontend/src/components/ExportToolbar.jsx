@@ -5,7 +5,7 @@ import useLayoutStore from '../store/layoutStore';
  * ExportToolbar — top toolbar with export actions, scale selector,
  * undo/redo, and view mode toggle.
  */
-export default function ExportToolbar() {
+export default function ExportToolbar({ viewMode = '2d', onViewModeChange }) {
     const [scale, setScale] = useState('1:100');
     const [exporting, setExporting] = useState(null);
 
@@ -107,8 +107,8 @@ export default function ExportToolbar() {
                     onClick={undo}
                     disabled={!canUndo()}
                     className={`p-1.5 rounded transition-colors ${canUndo()
-                            ? 'text-surface-300 hover:bg-surface-700'
-                            : 'text-surface-600 cursor-not-allowed'
+                        ? 'text-surface-300 hover:bg-surface-700'
+                        : 'text-surface-600 cursor-not-allowed'
                         }`}
                     title="Undo (Ctrl+Z)"
                 >
@@ -120,8 +120,8 @@ export default function ExportToolbar() {
                     onClick={redo}
                     disabled={!canRedo()}
                     className={`p-1.5 rounded transition-colors ${canRedo()
-                            ? 'text-surface-300 hover:bg-surface-700'
-                            : 'text-surface-600 cursor-not-allowed'
+                        ? 'text-surface-300 hover:bg-surface-700'
+                        : 'text-surface-600 cursor-not-allowed'
                         }`}
                     title="Redo (Ctrl+Shift+Z)"
                 >
@@ -142,6 +142,30 @@ export default function ExportToolbar() {
                     <option value="1:100">1:100</option>
                     <option value="1:200">1:200</option>
                 </select>
+
+                <div className="w-px h-5 bg-surface-600 mx-1" />
+
+                {/* 2D / 3D Toggle */}
+                <div className="flex items-center bg-surface-700 rounded-lg p-0.5 border border-surface-600">
+                    <button
+                        onClick={() => onViewModeChange?.('2d')}
+                        className={`px-2.5 py-1 rounded-md text-xs font-medium transition-all ${viewMode === '2d'
+                                ? 'bg-blueprint-600 text-white shadow-sm'
+                                : 'text-surface-400 hover:text-surface-200'
+                            }`}
+                    >
+                        2D
+                    </button>
+                    <button
+                        onClick={() => onViewModeChange?.('3d')}
+                        className={`px-2.5 py-1 rounded-md text-xs font-medium transition-all ${viewMode === '3d'
+                                ? 'bg-blueprint-600 text-white shadow-sm'
+                                : 'text-surface-400 hover:text-surface-200'
+                            }`}
+                    >
+                        3D
+                    </button>
+                </div>
             </div>
 
             {/* Right: Export buttons */}
@@ -151,8 +175,8 @@ export default function ExportToolbar() {
                     onClick={handleExportSVG}
                     disabled={!hasLayout || exporting === 'svg'}
                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${hasLayout
-                            ? 'bg-surface-700 text-surface-200 hover:bg-surface-600 border border-surface-600'
-                            : 'bg-surface-800 text-surface-600 cursor-not-allowed border border-surface-700'
+                        ? 'bg-surface-700 text-surface-200 hover:bg-surface-600 border border-surface-600'
+                        : 'bg-surface-800 text-surface-600 cursor-not-allowed border border-surface-700'
                         }`}
                 >
                     <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -166,8 +190,8 @@ export default function ExportToolbar() {
                     onClick={handleExportDXF}
                     disabled={!hasLayout || exporting === 'dxf'}
                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${hasLayout
-                            ? 'bg-blueprint-600 text-white hover:bg-blueprint-500 shadow-sm'
-                            : 'bg-surface-800 text-surface-600 cursor-not-allowed border border-surface-700'
+                        ? 'bg-blueprint-600 text-white hover:bg-blueprint-500 shadow-sm'
+                        : 'bg-surface-800 text-surface-600 cursor-not-allowed border border-surface-700'
                         }`}
                 >
                     <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">

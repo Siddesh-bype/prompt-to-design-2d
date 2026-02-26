@@ -1,27 +1,34 @@
 """
 Modified Swiss Dwellings (MSD) Adapter — Converts MSD graph data to our LayoutGraph format.
 
-MSD dataset structure (after extraction):
-    data/
-    └── modified_swiss_dwellings/
-        ├── metadata.csv              (building metadata)
-        └── graphs/
-            └── <building_id>.pkl     (networkx graph per floor plan)
+Actual MSD v2 dataset structure:
+    data/modified-swiss-dwellings-v2/
+    ├── train/
+    │   ├── graph_in/    (input graphs — zoning_type only)
+    │   ├── graph_out/   (output graphs — geometry + room_type + centroid)
+    │   ├── struct_in/   (numpy adjacency)
+    │   └── full_out/
+    └── test/
+        └── (same sub-structure)
 
-Each graph node represents a room with attributes:
-    - shape: Shapely polygon (room boundary)
-    - room_type: str (room category)
-    - zoning_type: str (zoning category)
+Each graph_out pickle contains a networkx Graph where:
+  - Nodes have: geometry (list of polygon coords), room_type (int), centroid (tensor)
+  - Edges have: connectivity ('door', 'window', 'wall', etc.)
 
-Each graph edge represents adjacency between rooms.
+Room type integers mapping (from MSD documentation):
+  0=LivingRoom, 1=Kitchen, 2=Bedroom, 3=Bathroom, 4=Hallway/Corridor,
+  5=Balcony, 6=Dining, 7=Storage/Utility, 8=Garage, 9=Study/Office
 """
 
 from __future__ import annotations
 
 import glob
 import logging
+import math
 import os
 import pickle
+import random
+from pathlib import Path
 from typing import Optional
 
 from app.models.schemas import (
@@ -38,81 +45,73 @@ from app.models.schemas import (
 
 logger = logging.getLogger(__name__)
 
-# ─── Category Mapping ────────────────────────────────────────────────────────
+# ─── Integer Room Type Mapping ───────────────────────────────────────────────
 
-# Map MSD room_type strings → our RoomType enum
-MSD_ROOM_MAP: dict[str, RoomType] = {
-    # Common MSD categories (German/English mix)
-    "kitchen": RoomType.KITCHEN,
-    "küche": RoomType.KITCHEN,
-    "living": RoomType.LIVING_ROOM,
-    "living_room": RoomType.LIVING_ROOM,
-    "livingroom": RoomType.LIVING_ROOM,
-    "wohnzimmer": RoomType.LIVING_ROOM,
-    "bedroom": RoomType.BEDROOM,
-    "schlafzimmer": RoomType.BEDROOM,
-    "room": RoomType.BEDROOM,
-    "zimmer": RoomType.BEDROOM,
-    "bathroom": RoomType.BATHROOM,
-    "bath": RoomType.BATHROOM,
-    "badezimmer": RoomType.BATHROOM,
-    "wc": RoomType.TOILET,
-    "toilet": RoomType.TOILET,
-    "toilette": RoomType.TOILET,
-    "corridor": RoomType.CORRIDOR,
-    "hallway": RoomType.CORRIDOR,
-    "flur": RoomType.CORRIDOR,
-    "gang": RoomType.CORRIDOR,
-    "entrance": RoomType.CORRIDOR,
-    "eingang": RoomType.CORRIDOR,
-    "balcony": RoomType.BALCONY,
-    "balkon": RoomType.BALCONY,
-    "loggia": RoomType.BALCONY,
-    "terrace": RoomType.BALCONY,
-    "terrasse": RoomType.BALCONY,
-    "storage": RoomType.UTILITY,
-    "abstellraum": RoomType.UTILITY,
-    "utility": RoomType.UTILITY,
-    "hauswirtschaft": RoomType.UTILITY,
-    "laundry": RoomType.UTILITY,
-    "waschküche": RoomType.UTILITY,
-    "garage": RoomType.GARAGE,
-    "parking": RoomType.GARAGE,
-    "study": RoomType.STUDY,
-    "arbeitszimmer": RoomType.STUDY,
-    "office": RoomType.STUDY,
-    "büro": RoomType.STUDY,
-    "dining": RoomType.DINING,
-    "dining_room": RoomType.DINING,
-    "esszimmer": RoomType.DINING,
+MSD_INT_ROOM_MAP: dict[int, RoomType] = {
+    0: RoomType.LIVING_ROOM,
+    1: RoomType.KITCHEN,
+    2: RoomType.BEDROOM,
+    3: RoomType.BATHROOM,
+    4: RoomType.CORRIDOR,
+    5: RoomType.BALCONY,
+    6: RoomType.DINING,
+    7: RoomType.UTILITY,
+    8: RoomType.GARAGE,
+    9: RoomType.STUDY,
 }
 
 
-def _map_room_type(msd_type: str) -> RoomType:
-    """Map an MSD room type string to our RoomType enum."""
-    lower = msd_type.lower().strip()
+def _map_room_type_int(room_type_int: int) -> RoomType:
+    """Map an MSD integer room type to our RoomType enum."""
+    return MSD_INT_ROOM_MAP.get(room_type_int, RoomType.UTILITY)
 
-    # Exact match
-    if lower in MSD_ROOM_MAP:
-        return MSD_ROOM_MAP[lower]
 
-    # Partial match
-    for key, room_type in MSD_ROOM_MAP.items():
-        if key in lower or lower in key:
-            return room_type
+def _geometry_to_bbox(geometry: list) -> tuple[float, float, float, float] | None:
+    """Convert polygon geometry to (x_min, y_min, x_max, y_max)."""
+    try:
+        if not geometry:
+            return None
+        xs = [p[0] for p in geometry]
+        ys = [p[1] for p in geometry]
+        return (min(xs), min(ys), max(xs), max(ys))
+    except Exception:
+        return None
 
-    # Default fallback
-    return RoomType.UTILITY
+
+def _polygon_area(geometry: list) -> float:
+    """Compute polygon area via shoelace formula."""
+    try:
+        n = len(geometry)
+        if n < 3:
+            return 0.0
+        area = 0.0
+        for i in range(n):
+            j = (i + 1) % n
+            area += geometry[i][0] * geometry[j][1]
+            area -= geometry[j][0] * geometry[i][1]
+        return abs(area) / 2.0
+    except Exception:
+        return 0.0
+
+
+def _connection_type_from_str(conn: str) -> ConnectionType:
+    """Map MSD connectivity string to ConnectionType."""
+    conn_lower = conn.lower() if conn else ""
+    if "door" in conn_lower:
+        return ConnectionType.DOOR
+    elif "window" in conn_lower or "opening" in conn_lower:
+        return ConnectionType.OPENING
+    return ConnectionType.WALL
 
 
 # ─── Graph Parsing ───────────────────────────────────────────────────────────
 
 
-def parse_msd_graph(graph_path: str) -> Optional[dict]:
-    """Parse a single MSD graph file (.pkl or .pt).
+def parse_msd_graph(graph_path: str) -> dict | None:
+    """Parse a single MSD graph_out pickle file.
 
     Args:
-        graph_path: Path to the graph file
+        graph_path: Path to the graph_out pickle file
 
     Returns:
         Dict with parsed_layout and layout_graph, or None if parsing fails
@@ -121,208 +120,128 @@ def parse_msd_graph(graph_path: str) -> Optional[dict]:
         with open(graph_path, "rb") as f:
             graph = pickle.load(f)
     except Exception as e:
-        logger.warning(f"Failed to load graph {graph_path}: {e}")
+        logger.debug(f"Failed to load {graph_path}: {e}")
         return None
 
-    # Extract nodes (rooms) and edges
-    nodes = []
-    edges = []
-
-    try:
-        # networkx graph
-        if hasattr(graph, "nodes") and hasattr(graph, "edges"):
-            for node_id, attrs in graph.nodes(data=True):
-                nodes.append({
-                    "id": str(node_id),
-                    "attrs": attrs,
-                })
-            for u, v, attrs in graph.edges(data=True):
-                edges.append((str(u), str(v), attrs))
-        # Dict-based format
-        elif isinstance(graph, dict):
-            if "nodes" in graph:
-                for n in graph["nodes"]:
-                    if isinstance(n, dict):
-                        nodes.append({"id": str(n.get("id", len(nodes))), "attrs": n})
-                    else:
-                        nodes.append({"id": str(len(nodes)), "attrs": {}})
-            if "edges" in graph:
-                for e in graph["edges"]:
-                    if isinstance(e, (list, tuple)) and len(e) >= 2:
-                        edges.append((str(e[0]), str(e[1]), e[2] if len(e) > 2 else {}))
-        else:
-            logger.warning(f"Unknown graph format: {type(graph)}")
-            return None
-    except Exception as e:
-        logger.warning(f"Failed to parse graph structure: {e}")
-        return None
+    nodes = list(graph.nodes(data=True))
+    edges = list(graph.edges(data=True))
 
     if len(nodes) < 2:
         return None
 
-    # Extract room data from node attributes
-    rooms_data = []
-    global_x_min = global_y_min = float("inf")
-    global_x_max = global_y_max = float("-inf")
+    # Collect raw bboxes for normalisation
+    raw_rooms = []
+    for node_id, attrs in nodes:
+        geometry = attrs.get("geometry", [])
+        room_type_int = attrs.get("room_type", 7)
 
-    for node in nodes:
-        attrs = node["attrs"]
-
-        # Get room type
-        room_type_str = (
-            attrs.get("room_type", "")
-            or attrs.get("roomtype", "")
-            or attrs.get("type", "")
-            or attrs.get("category", "")
-            or attrs.get("label", "")
-            or "room"
-        )
-        room_type = _map_room_type(str(room_type_str))
-
-        # Get room shape / polygon / bounding box
-        shape = attrs.get("shape", None)
-        bbox = None
-        area = None
-
-        if shape is not None:
-            # Shapely polygon
-            try:
-                if hasattr(shape, "bounds"):
-                    x_min, y_min, x_max, y_max = shape.bounds
-                    bbox = (x_min, y_min, x_max, y_max)
-                    area = float(shape.area)
-                elif hasattr(shape, "__iter__"):
-                    # List of coordinates
-                    coords = list(shape)
-                    if coords:
-                        xs = [c[0] for c in coords]
-                        ys = [c[1] for c in coords]
-                        bbox = (min(xs), min(ys), max(xs), max(ys))
-                        area = abs(max(xs) - min(xs)) * abs(max(ys) - min(ys))
-            except Exception:
-                pass
-
-        # Try other attributes for bounds
-        if bbox is None:
-            if all(k in attrs for k in ("x_min", "y_min", "x_max", "y_max")):
-                bbox = (attrs["x_min"], attrs["y_min"], attrs["x_max"], attrs["y_max"])
-            elif all(k in attrs for k in ("x", "y", "width", "height")):
-                x, y, w, h = attrs["x"], attrs["y"], attrs["width"], attrs["height"]
-                bbox = (x, y, x + w, y + h)
-            elif "bounds" in attrs:
-                b = attrs["bounds"]
-                if len(b) == 4:
-                    bbox = tuple(b)
-            elif "position" in attrs and "size" in attrs:
-                pos = attrs["position"]
-                size = attrs["size"]
-                bbox = (pos[0], pos[1], pos[0] + size[0], pos[1] + size[1])
-
-        if bbox is None:
+        bbox_raw = _geometry_to_bbox(geometry)
+        if bbox_raw is None:
             continue
 
-        if area is None:
-            area = abs(bbox[2] - bbox[0]) * abs(bbox[3] - bbox[1])
+        area = _polygon_area(geometry)
+        room_type = _map_room_type_int(room_type_int)
 
-        if area < 0.5:  # Skip tiny elements
-            continue
-
-        # Update global bounds
-        global_x_min = min(global_x_min, bbox[0])
-        global_y_min = min(global_y_min, bbox[1])
-        global_x_max = max(global_x_max, bbox[2])
-        global_y_max = max(global_y_max, bbox[3])
-
-        rooms_data.append({
-            "id": node["id"],
+        raw_rooms.append({
+            "node_id": node_id,
             "room_type": room_type,
-            "bbox": bbox,
             "area": area,
+            "bbox": bbox_raw,
         })
 
-    if len(rooms_data) < 2:
+    if len(raw_rooms) < 2:
         return None
 
-    # Normalise bounding boxes
-    w_range = max(global_x_max - global_x_min, 1e-6)
-    h_range = max(global_y_max - global_y_min, 1e-6)
+    # Cap at 30 rooms (keep largest by area to preserve main rooms)
+    if len(raw_rooms) > 30:
+        raw_rooms.sort(key=lambda r: r["area"], reverse=True)
+        raw_rooms = raw_rooms[:30]
 
-    # Plot area in m² (assume coordinates are in metres)
-    plot_area_sqm = w_range * h_range
-    if plot_area_sqm > 10000:
-        # Probably in cm or mm — convert
-        plot_area_sqm /= 10000.0
-    plot_area_sqm = max(plot_area_sqm, 30.0)
+    # Compute global bounding box for normalisation
+    all_x_min = min(r["bbox"][0] for r in raw_rooms)
+    all_y_min = min(r["bbox"][1] for r in raw_rooms)
+    all_x_max = max(r["bbox"][2] for r in raw_rooms)
+    all_y_max = max(r["bbox"][3] for r in raw_rooms)
 
+    width = max(all_x_max - all_x_min, 1e-6)
+    height = max(all_y_max - all_y_min, 1e-6)
+    scale = max(width, height)
+
+    # Build rooms
     room_specs = []
     room_layouts = []
-    id_to_idx = {}
+    node_to_room_id = {}
 
-    # Find master bedroom (largest bedroom)
-    bedroom_sizes = [(i, r["area"]) for i, r in enumerate(rooms_data)
-                     if r["room_type"] in (RoomType.BEDROOM, RoomType.MASTER_BEDROOM)]
-    master_idx = max(bedroom_sizes, key=lambda x: x[1])[0] if bedroom_sizes else -1
+    for i, raw in enumerate(raw_rooms):
+        room_id = f"room_{i + 1}"
+        node_to_room_id[raw["node_id"]] = room_id
 
-    for i, room in enumerate(rooms_data):
-        room_type = room["room_type"]
-        if i == master_idx:
-            room_type = RoomType.MASTER_BEDROOM
-
-        # Convert area
-        area_sqm = room["area"]
-        if area_sqm > 1000:
-            area_sqm /= 10000.0  # cm² → m²
-        area_sqm = max(area_sqm, 3.0)
+        area_sqm = max(4.0, min(raw["area"], 200.0))
 
         spec = RoomSpec(
-            room_id=f"room_{i + 1}",
-            room_type=room_type,
+            room_id=room_id,
+            room_type=raw["room_type"],
             target_area_sqm=round(area_sqm, 1),
         )
         room_specs.append(spec)
 
-        # Normalise bbox to [0,1]
-        x_min, y_min, x_max, y_max = room["bbox"]
-        bbox = BoundingBox(
-            x_min=max(0, (x_min - global_x_min) / w_range),
-            y_min=max(0, (y_min - global_y_min) / h_range),
-            x_max=min(1, (x_max - global_x_min) / w_range),
-            y_max=min(1, (y_max - global_y_min) / h_range),
-        )
+        x_min = max(0.0, (raw["bbox"][0] - all_x_min) / scale)
+        y_min = max(0.0, (raw["bbox"][1] - all_y_min) / scale)
+        x_max = min(1.0, (raw["bbox"][2] - all_x_min) / scale)
+        y_max = min(1.0, (raw["bbox"][3] - all_y_min) / scale)
 
-        room_layouts.append(RoomLayout(room_spec=spec, bbox=bbox))
-        id_to_idx[room["id"]] = i
+        # Clamp
+        x_max = max(x_max, x_min + 0.01)
+        y_max = max(y_max, y_min + 0.01)
+        x_max = min(x_max, 1.0)
+        y_max = min(y_max, 1.0)
 
-    # Build adjacency edges from graph edges
+        try:
+            room_layouts.append(RoomLayout(
+                room_spec=spec,
+                bbox=BoundingBox(
+                    x_min=round(x_min, 6),
+                    y_min=round(y_min, 6),
+                    x_max=round(x_max, 6),
+                    y_max=round(y_max, 6),
+                ),
+            ))
+        except Exception:
+            continue
+
+    if len(room_layouts) < 2:
+        return None
+
+    # Build adjacency edges
     adjacency_edges = []
-    for u, v, attrs in edges:
-        if u in id_to_idx and v in id_to_idx:
-            conn_type = ConnectionType.DOOR
-            types = {rooms_data[id_to_idx[u]]["room_type"],
-                     rooms_data[id_to_idx[v]]["room_type"]}
-            if types & {RoomType.KITCHEN, RoomType.DINING, RoomType.LIVING_ROOM}:
-                conn_type = ConnectionType.OPENING
-
+    for u, v, edge_attrs in edges:
+        room_a = node_to_room_id.get(u)
+        room_b = node_to_room_id.get(v)
+        if room_a and room_b:
+            conn_str = edge_attrs.get("connectivity", "wall")
             adjacency_edges.append(AdjacencyEdge(
-                room_a_id=room_specs[id_to_idx[u]].room_id,
-                room_b_id=room_specs[id_to_idx[v]].room_id,
-                connection_type=conn_type,
+                room_a_id=room_a,
+                room_b_id=room_b,
+                connection_type=_connection_type_from_str(conn_str),
                 required=True,
             ))
 
+    # Estimate plot area
+    total_area = sum(r["area"] for r in raw_rooms)
+    plot_area = max(30.0, min(total_area * 1.2, 2000.0))
+
     parsed = ParsedLayout(
         rooms=room_specs,
-        plot_area_sqm=round(plot_area_sqm, 1),
-        facing=CompassFacing.NORTH,
+        plot_area_sqm=round(plot_area, 1),
+        facing=random.choice(list(CompassFacing)),
         adjacency_constraints=adjacency_edges,
-        vastu_enabled=False,
     )
 
     layout_graph = LayoutGraph(
         rooms=room_layouts,
         adjacency_edges=adjacency_edges,
-        plot_area_sqm=round(plot_area_sqm, 1),
-        facing=CompassFacing.NORTH,
+        plot_area_sqm=round(plot_area, 1),
+        facing=parsed.facing,
         generation_mode="heuristic",
     )
 
@@ -341,6 +260,8 @@ def load_swiss_dwellings_dataset(
 ) -> list[dict]:
     """Load Modified Swiss Dwellings dataset.
 
+    Searches for graph_out pickle files in the dataset directory.
+
     Args:
         data_dir: Path to extracted MSD root directory
         max_samples: Optional max number of samples
@@ -348,136 +269,51 @@ def load_swiss_dwellings_dataset(
     Returns:
         List of dicts with parsed_layout and layout_graph keys
     """
-    # Find graph files
-    graph_files = sorted(
-        glob.glob(os.path.join(data_dir, "**", "*.pkl"), recursive=True)
-    )
+    # Find graph_out pickle files
+    graph_patterns = [
+        os.path.join(data_dir, "train", "graph_out", "*.pickle"),
+        os.path.join(data_dir, "test", "graph_out", "*.pickle"),
+        os.path.join(data_dir, "graph_out", "*.pickle"),
+        os.path.join(data_dir, "*.pickle"),
+        os.path.join(data_dir, "**", "graph_out", "*.pickle"),
+    ]
 
-    if not graph_files:
-        # Also try .pt files
-        graph_files = sorted(
-            glob.glob(os.path.join(data_dir, "**", "*.pt"), recursive=True)
-        )
+    pickle_files = []
+    for pattern in graph_patterns:
+        found = glob.glob(pattern, recursive=True)
+        pickle_files.extend(found)
+        if pickle_files:
+            break
 
-    if not graph_files:
-        # Try JSON format
-        graph_files = sorted(
-            glob.glob(os.path.join(data_dir, "**", "*.json"), recursive=True)
-        )
-        if graph_files:
-            return _load_json_format(graph_files, max_samples)
+    if not pickle_files:
+        # Try .pkl extension too
+        for pattern in graph_patterns:
+            found = glob.glob(pattern.replace(".pickle", ".pkl"), recursive=True)
+            pickle_files.extend(found)
+            if pickle_files:
+                break
 
-    if max_samples:
-        graph_files = graph_files[:max_samples]
+    pickle_files = sorted(set(pickle_files))
 
-    logger.info(f"Found {len(graph_files)} MSD graph files in {data_dir}")
+    if not pickle_files:
+        logger.warning(f"No MSD pickle files found in {data_dir}")
+        return []
+
+    logger.info(f"Found {len(pickle_files)} MSD graph files")
+
+    if max_samples and len(pickle_files) > max_samples:
+        random.shuffle(pickle_files)
+        pickle_files = pickle_files[:max_samples]
 
     samples = []
-    for path in graph_files:
-        result = parse_msd_graph(path)
-        if result and len(result["layout_graph"]["rooms"]) >= 2:
+    errors = 0
+
+    for pkl_path in pickle_files:
+        result = parse_msd_graph(pkl_path)
+        if result:
             samples.append(result)
+        else:
+            errors += 1
 
-    logger.info(f"Loaded {len(samples)} MSD samples")
+    logger.info(f"MSD: Loaded {len(samples)} samples ({errors} errors)")
     return samples
-
-
-def _load_json_format(json_files: list[str], max_samples: int | None = None) -> list[dict]:
-    """Fallback: load MSD data from JSON files."""
-    import json
-
-    if max_samples:
-        json_files = json_files[:max_samples]
-
-    samples = []
-    for path in json_files:
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-
-            # If already in our format
-            if "parsed_layout" in data and "layout_graph" in data:
-                samples.append(data)
-                continue
-
-            # If it's a list of apartments/floor plans
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if isinstance(item, dict):
-                    result = _convert_json_item(item)
-                    if result:
-                        samples.append(result)
-        except Exception as e:
-            logger.warning(f"Failed to load JSON {path}: {e}")
-
-    logger.info(f"Loaded {len(samples)} MSD samples from JSON")
-    return samples
-
-
-def _convert_json_item(item: dict) -> Optional[dict]:
-    """Convert a single JSON item from MSD to our format."""
-    rooms = item.get("rooms", item.get("areas", []))
-    if not rooms or len(rooms) < 2:
-        return None
-
-    room_specs = []
-    room_layouts = []
-
-    for i, room in enumerate(rooms):
-        if isinstance(room, dict):
-            rt_str = room.get("type", room.get("room_type", room.get("category", "room")))
-            room_type = _map_room_type(str(rt_str))
-
-            area = float(room.get("area", room.get("size", 10.0)))
-            if area > 1000:
-                area /= 10000.0
-
-            spec = RoomSpec(
-                room_id=f"room_{i + 1}",
-                room_type=room_type,
-                target_area_sqm=round(max(area, 3.0), 1),
-            )
-            room_specs.append(spec)
-
-            # Get bbox
-            bbox_data = room.get("bbox", room.get("bounds", None))
-            if bbox_data and len(bbox_data) == 4:
-                bbox = BoundingBox(
-                    x_min=max(0, min(1, float(bbox_data[0]))),
-                    y_min=max(0, min(1, float(bbox_data[1]))),
-                    x_max=max(0, min(1, float(bbox_data[2]))),
-                    y_max=max(0, min(1, float(bbox_data[3]))),
-                )
-            else:
-                # Generate placeholder
-                row = i // 3
-                col = i % 3
-                bbox = BoundingBox(
-                    x_min=col * 0.33,
-                    y_min=row * 0.33,
-                    x_max=min(1, (col + 1) * 0.33),
-                    y_max=min(1, (row + 1) * 0.33),
-                )
-
-            room_layouts.append(RoomLayout(room_spec=spec, bbox=bbox))
-
-    plot_area = float(item.get("plot_area", item.get("total_area", 100.0)))
-
-    parsed = ParsedLayout(
-        rooms=room_specs,
-        plot_area_sqm=round(plot_area, 1),
-        facing=CompassFacing.NORTH,
-    )
-
-    layout_graph = LayoutGraph(
-        rooms=room_layouts,
-        adjacency_edges=[],
-        plot_area_sqm=round(plot_area, 1),
-        facing=CompassFacing.NORTH,
-        generation_mode="heuristic",
-    )
-
-    return {
-        "parsed_layout": parsed.model_dump(),
-        "layout_graph": layout_graph.model_dump(),
-    }

@@ -1,8 +1,8 @@
 """
-Job Queue — Redis + RQ integration for background task processing.
+Job Queue — In-memory job management for background task processing.
 
 Provides functions to enqueue layout generation jobs, poll status,
-and manage job lifecycle.
+and manage job lifecycle using a simple thread-safe dictionary.
 """
 
 from __future__ import annotations
@@ -10,44 +10,31 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+import asyncio
+import threading
+from datetime import datetime
 from typing import Optional
 
-import redis
-
-from app.core.config import settings
 from app.models.schemas import JobStatusResponse, LayoutGraph
 
 logger = logging.getLogger(__name__)
 
 
-# ─── Redis Connection ────────────────────────────────────────────────────────
+# ─── In-Memory Store ─────────────────────────────────────────────────────────
 
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
 
-def get_redis_connection() -> redis.Redis:
-    """Get a Redis client connection.
-
-    Returns:
-        redis.Redis client instance
-    """
-    return redis.Redis(
-        host=settings.redis_host,
-        port=settings.redis_port,
-        db=0,
-        decode_responses=True,
-    )
+# Subscribers: job_id -> list of asyncio.Queue
+_subscribers: dict[str, list[asyncio.Queue]] = {}
+_subscribers_lock = threading.Lock()
 
 
 # ─── Job Key Helpers ─────────────────────────────────────────────────────────
 
 
-def _job_key(job_id: str) -> str:
-    """Generate Redis key for a job."""
-    return f"blueprint:job:{job_id}"
-
-
 def _ws_channel(job_id: str) -> str:
-    """Generate Redis pub/sub channel for job WebSocket updates."""
+    """Generate channel name for job WebSocket updates."""
     return f"blueprint:ws:{job_id}"
 
 
@@ -60,7 +47,7 @@ def enqueue_job(
     facing: str,
     vastu_enabled: bool,
 ) -> str:
-    """Create a new layout generation job and store it in Redis.
+    """Create a new layout generation job and store it in memory.
 
     Args:
         prompt: User prompt text
@@ -72,7 +59,6 @@ def enqueue_job(
         job_id string (UUID)
     """
     job_id = str(uuid.uuid4())
-    r = get_redis_connection()
 
     job_data = {
         "job_id": job_id,
@@ -88,15 +74,15 @@ def enqueue_job(
         "error": "",
     }
 
-    r.hset(_job_key(job_id), mapping=job_data)
-    r.expire(_job_key(job_id), int(timedelta(hours=1).total_seconds()))
+    with _jobs_lock:
+        _jobs[job_id] = job_data
 
     # Publish creation event
-    r.publish(_ws_channel(job_id), json.dumps({
+    _publish(job_id, {
         "type": "status",
         "status": "queued",
         "progress_pct": 0,
-    }))
+    })
 
     logger.info(f"Job {job_id} enqueued: '{prompt[:50]}...'")
     return job_id
@@ -113,7 +99,7 @@ def update_job_status(
     svg_string: Optional[str] = None,
     error: Optional[dict] = None,
 ) -> None:
-    """Update a job's status in Redis and publish via pub/sub.
+    """Update a job's status in memory and notify subscribers.
 
     Args:
         job_id: Job UUID
@@ -123,22 +109,19 @@ def update_job_status(
         svg_string: Optional SVG string
         error: Optional error detail dict
     """
-    r = get_redis_connection()
-    key = _job_key(job_id)
+    with _jobs_lock:
+        if job_id not in _jobs:
+            return
 
-    updates = {
-        "status": status,
-        "progress_pct": str(progress_pct),
-    }
+        _jobs[job_id]["status"] = status
+        _jobs[job_id]["progress_pct"] = str(progress_pct)
 
-    if result is not None:
-        updates["result"] = json.dumps(result)
-    if svg_string is not None:
-        updates["svg_string"] = svg_string
-    if error is not None:
-        updates["error"] = json.dumps(error)
-
-    r.hset(key, mapping=updates)
+        if result is not None:
+            _jobs[job_id]["result"] = json.dumps(result)
+        if svg_string is not None:
+            _jobs[job_id]["svg_string"] = svg_string
+        if error is not None:
+            _jobs[job_id]["error"] = json.dumps(error)
 
     # Publish WebSocket update
     ws_msg = {
@@ -153,16 +136,52 @@ def update_job_status(
     if error is not None:
         ws_msg["error"] = error
 
-    r.publish(_ws_channel(job_id), json.dumps(ws_msg))
+    _publish(job_id, ws_msg)
 
     logger.info(f"Job {job_id}: {status} ({progress_pct}%)")
+
+
+# ─── Pub/Sub (In-Memory) ────────────────────────────────────────────────────
+
+
+def _publish(job_id: str, message: dict) -> None:
+    """Publish a message to all subscribers of a job."""
+    with _subscribers_lock:
+        queues = _subscribers.get(job_id, [])
+        for q in queues:
+            try:
+                q.put_nowait(message)
+            except asyncio.QueueFull:
+                pass
+
+
+def subscribe(job_id: str) -> asyncio.Queue:
+    """Subscribe to updates for a job. Returns an asyncio.Queue."""
+    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    with _subscribers_lock:
+        if job_id not in _subscribers:
+            _subscribers[job_id] = []
+        _subscribers[job_id].append(q)
+    return q
+
+
+def unsubscribe(job_id: str, q: asyncio.Queue) -> None:
+    """Unsubscribe from job updates."""
+    with _subscribers_lock:
+        if job_id in _subscribers:
+            try:
+                _subscribers[job_id].remove(q)
+            except ValueError:
+                pass
+            if not _subscribers[job_id]:
+                del _subscribers[job_id]
 
 
 # ─── Get Job Status ─────────────────────────────────────────────────────────
 
 
 def get_job_status(job_id: str) -> Optional[JobStatusResponse]:
-    """Retrieve current job status from Redis.
+    """Retrieve current job status from memory.
 
     Args:
         job_id: Job UUID
@@ -170,11 +189,11 @@ def get_job_status(job_id: str) -> Optional[JobStatusResponse]:
     Returns:
         JobStatusResponse or None if job not found
     """
-    r = get_redis_connection()
-    data = r.hgetall(_job_key(job_id))
-
-    if not data:
-        return None
+    with _jobs_lock:
+        data = _jobs.get(job_id)
+        if not data:
+            return None
+        data = dict(data)  # Copy to avoid race
 
     result = None
     svg_string = None
@@ -213,7 +232,7 @@ def get_job_status(job_id: str) -> Optional[JobStatusResponse]:
 
 
 def delete_job(job_id: str) -> bool:
-    """Delete a job from Redis.
+    """Delete a job from memory.
 
     Args:
         job_id: Job UUID
@@ -221,5 +240,8 @@ def delete_job(job_id: str) -> bool:
     Returns:
         True if job was deleted, False if not found
     """
-    r = get_redis_connection()
-    return r.delete(_job_key(job_id)) > 0
+    with _jobs_lock:
+        if job_id in _jobs:
+            del _jobs[job_id]
+            return True
+        return False

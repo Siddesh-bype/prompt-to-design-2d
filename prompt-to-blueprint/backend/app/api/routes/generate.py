@@ -15,7 +15,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
-from app.core.job_queue import enqueue_job, get_job_status, update_job_status
+from app.core.job_queue import enqueue_job, get_job_status, update_job_status, subscribe, unsubscribe
 from app.models.schemas import (
     GenerateRequest,
     GenerateResponse,
@@ -48,10 +48,9 @@ async def generate_layout(request: GenerateRequest) -> GenerateResponse:
         raise HTTPException(status_code=503, detail="Job queue unavailable")
 
     # Trigger the worker in background
-    # In production this would be handled by RQ; for dev, run inline
     try:
         from app.workers.layout_worker import run_layout_pipeline
-        asyncio.get_event_loop().run_in_executor(
+        asyncio.get_running_loop().run_in_executor(
             None,
             run_layout_pipeline,
             job_id,
@@ -91,24 +90,13 @@ async def get_job(job_id: str) -> JobStatusResponse:
 async def websocket_job_stream(websocket: WebSocket, job_id: str):
     """Stream real-time job updates via WebSocket.
 
-    Subscribes to Redis pub/sub channel for the job and forwards
-    all status updates to the connected client.
+    Uses in-memory pub/sub queue to forward status updates to the client.
     """
     await websocket.accept()
 
+    queue = subscribe(job_id)
+
     try:
-        import redis
-
-        r = redis.Redis(
-            host=settings.redis_host,
-            port=settings.redis_port,
-            db=0,
-            decode_responses=True,
-        )
-        pubsub = r.pubsub()
-        channel = f"blueprint:ws:{job_id}"
-        pubsub.subscribe(channel)
-
         logger.info(f"WS connected for job {job_id}")
 
         # Send current status immediately
@@ -116,22 +104,20 @@ async def websocket_job_stream(websocket: WebSocket, job_id: str):
         if current:
             await websocket.send_json(current.model_dump())
 
-        # Listen for updates
+        # Listen for updates from the in-memory queue
         while True:
-            message = pubsub.get_message(timeout=0.5)
-            if message and message["type"] == "message":
-                data = message["data"]
-                if isinstance(data, str):
-                    parsed = json.loads(data)
-                    await websocket.send_json(parsed)
+            try:
+                message = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.2)
+                continue
 
-                    # Close WebSocket when job is complete or errored
-                    status = parsed.get("status", "")
-                    if status in ("complete", "error"):
-                        break
+            await websocket.send_json(message)
 
-            # Small sleep to avoid busy loop
-            await asyncio.sleep(0.1)
+            # Close WebSocket when job is complete or errored
+            status = message.get("status", "")
+            if status in ("complete", "error"):
+                break
 
     except WebSocketDisconnect:
         logger.info(f"WS disconnected for job {job_id}")
@@ -142,11 +128,7 @@ async def websocket_job_stream(websocket: WebSocket, job_id: str):
         except Exception:
             pass
     finally:
-        try:
-            pubsub.unsubscribe(channel)
-            pubsub.close()
-        except Exception:
-            pass
+        unsubscribe(job_id, queue)
 
 
 # ─── GET /health ─────────────────────────────────────────────────────────────
@@ -160,26 +142,15 @@ async def health_check():
         "services": {},
     }
 
-    # Check Redis
-    try:
-        import redis
-        r = redis.Redis(
-            host=settings.redis_host,
-            port=settings.redis_port,
-            db=0,
-        )
-        r.ping()
-        health["services"]["redis"] = "connected"
-    except Exception:
-        health["services"]["redis"] = "disconnected"
-
-    # Check Ollama
-    try:
-        import httpx
-        resp = httpx.get(f"{settings.ollama_host}/api/version", timeout=3)
-        health["services"]["ollama"] = "connected"
-    except Exception:
-        health["services"]["ollama"] = "disconnected"
+    # NLP Provider
+    health["services"]["nlp_provider"] = settings.nlp_provider
+    from app.services.nlp_parser import _is_valid_key
+    providers = []
+    if _is_valid_key(settings.anthropic_api_key):
+        providers.append("claude")
+    if _is_valid_key(settings.openrouter_api_key):
+        providers.append("openrouter")
+    health["services"]["nlp_status"] = " → ".join(providers) if providers else "none configured"
 
     # Model registry
     try:

@@ -412,6 +412,7 @@ def compute_loss(
     gt_bboxes: torch.Tensor,
     pred_edges: torch.Tensor | None = None,
     gt_adjacency: torch.Tensor | None = None,
+    batch_index: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute training loss for the GNN model.
 
@@ -422,6 +423,7 @@ def compute_loss(
         gt_bboxes: Ground truth bounding boxes [N, 4]
         pred_edges: Predicted edge features [E, 2] (optional)
         gt_adjacency: Ground truth adjacency [E] (optional)
+        batch_index: Graph assignment for each node [N] (optional)
 
     Returns:
         Dict with keys: total, giou, overlap, adj_bce
@@ -430,7 +432,7 @@ def compute_loss(
     giou_loss = _giou_loss(pred_bboxes, gt_bboxes)
 
     # Overlap Loss: penalise pairwise overlaps
-    overlap_loss = _overlap_loss(pred_bboxes)
+    overlap_loss = _overlap_loss(pred_bboxes, batch_index)
 
     # Adjacency BCE Loss
     if pred_edges is not None and gt_adjacency is not None:
@@ -485,23 +487,30 @@ def _giou_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     return (1 - giou).mean()
 
 
-def _overlap_loss(bboxes: torch.Tensor) -> torch.Tensor:
-    """Compute pairwise overlap loss between all room pairs."""
+def _overlap_loss(bboxes: torch.Tensor, batch_index: torch.Tensor | None = None) -> torch.Tensor:
+    """Compute pairwise overlap loss between all room pairs within the same graph."""
     N = bboxes.size(0)
     if N < 2:
         return torch.tensor(0.0, device=bboxes.device)
 
-    total_overlap = torch.tensor(0.0, device=bboxes.device)
+    # Broadcast: [N, 1, 4] vs [1, N, 4]
+    b1 = bboxes.unsqueeze(1)  # [N, 1, 4]
+    b2 = bboxes.unsqueeze(0)  # [1, N, 4]
 
-    for i in range(N):
-        for j in range(i + 1, N):
-            # Intersection area
-            inter_x1 = torch.max(bboxes[i, 0], bboxes[j, 0])
-            inter_y1 = torch.max(bboxes[i, 1], bboxes[j, 1])
-            inter_x2 = torch.min(bboxes[i, 2], bboxes[j, 2])
-            inter_y2 = torch.min(bboxes[i, 3], bboxes[j, 3])
-            inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * \
-                         torch.clamp(inter_y2 - inter_y1, min=0)
-            total_overlap = total_overlap + inter_area
+    # Intersection
+    inter_x1 = torch.max(b1[:, :, 0], b2[:, :, 0])
+    inter_y1 = torch.max(b1[:, :, 1], b2[:, :, 1])
+    inter_x2 = torch.min(b1[:, :, 2], b2[:, :, 2])
+    inter_y2 = torch.min(b1[:, :, 3], b2[:, :, 3])
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * \
+                 torch.clamp(inter_y2 - inter_y1, min=0)
 
-    return total_overlap
+    # Sum upper triangle only (avoid double counting + self overlap)
+    mask = torch.triu(torch.ones(N, N, device=bboxes.device, dtype=torch.bool), diagonal=1)
+
+    if batch_index is not None:
+        # Only penalize overlap for rooms in the SAME graph batch
+        batch_mask = batch_index.unsqueeze(1) == batch_index.unsqueeze(0)
+        mask = mask & batch_mask
+
+    return inter_area[mask].sum()

@@ -1,0 +1,16 @@
+{
+  "total_rooms_analysed": 11,
+  "zone_frequencies": {
+    "N_LIVING_ROOM": 1,
+    "SW_BEDROOM": 1,
+    "S_KITCHEN": 1,
+    "SW_BATHROOM": 1,
+    "NW_LIVING_ROOM": 1,
+    "NE_MASTER_BEDROOM": 1,
+    "W_BEDROOM": 1,
+    "E_BEDROOM": 1,
+    "SW_KITCHEN": 1,
+    "S_BATHROOM": 1,
+    "SE_BATHROOM": 1
+  }
+}

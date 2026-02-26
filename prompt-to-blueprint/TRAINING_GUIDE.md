@@ -126,7 +126,7 @@ python -m app.services.train_all --dataset combined --data-dir data --epochs 100
 | `models/constraint_weights.json` | Constraints | Optimised weights |
 | `models/vastu_calibration.json` | Vastu | Zone frequency stats |
 | `data/training/nlp_finetune.jsonl` | NLP | Fine-tuning pairs |
-| `data/training/Modelfile` | NLP | Ollama model definition |
+| `data/training/Modelfile` | NLP | Ollama model definition | 
 
 ---
 

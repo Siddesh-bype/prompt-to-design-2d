@@ -35,23 +35,18 @@ async def lifespan(app: FastAPI):
     logger.info("  Prompt-to-Blueprint AI — Starting Up")
     logger.info("=" * 60)
 
-    # Check Redis
-    try:
-        import redis
-        r = redis.Redis(host=settings.redis_host, port=settings.redis_port, db=0)
-        r.ping()
-        logger.info(f"✓ Redis connected at {settings.redis_host}:{settings.redis_port}")
-    except Exception as e:
-        logger.warning(f"✗ Redis not available: {e}")
-
-    # Check Ollama
-    try:
-        import httpx
-        resp = httpx.get(f"{settings.ollama_host}/api/version", timeout=5)
-        version = resp.json().get("version", "unknown")
-        logger.info(f"✓ Ollama connected at {settings.ollama_host} (v{version})")
-    except Exception as e:
-        logger.warning(f"✗ Ollama not available: {e}")
+    # Log NLP provider config
+    from app.core.config import settings as _s
+    from app.services.nlp_parser import _is_valid_key
+    providers = []
+    if _is_valid_key(_s.anthropic_api_key):
+        providers.append(f"Claude ({_s.claude_model})")
+    if _is_valid_key(_s.openrouter_api_key):
+        providers.append(f"OpenRouter ({_s.openrouter_model})")
+    if providers:
+        logger.info(f"✓ NLP providers: {' → '.join(providers)}")
+    else:
+        logger.warning("✗ No NLP provider configured! Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY in .env")
 
     # Warm up model registry
     try:

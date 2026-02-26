@@ -361,81 +361,118 @@ def heuristic_place(
     plot_width: float = 10.0,
     plot_height: float = 10.0,
 ) -> LayoutGraph:
-    """Place rooms using a strip-packing algorithm.
+    """Place rooms using a squarified treemap algorithm.
 
-    Rooms are placed in priority order, stacked vertically in strips.
+    Recursively subdivides the plot rectangle so rooms fill the
+    entire area with zero gaps. Each room's slice is proportional
+    to its target_area_sqm.
     """
     n = len(layout.rooms)
     if n == 0:
         return layout
 
-    # Sort rooms by priority
-    def priority_key(room: RoomLayout) -> int:
+    # Sort rooms by priority (largest/most important first)
+    def priority_key(room: RoomLayout) -> tuple[int, float]:
         try:
-            return ROOM_PRIORITY.index(room.room_spec.room_type)
+            pri = ROOM_PRIORITY.index(room.room_spec.room_type)
         except ValueError:
-            return len(ROOM_PRIORITY)
+            pri = len(ROOM_PRIORITY)
+        return (pri, -room.room_spec.target_area_sqm)
 
     sorted_rooms = sorted(layout.rooms, key=priority_key)
 
-    # Strip-packing: place rooms left-to-right, then wrap down
+    # Compute area weights (normalised so they sum to 1.0)
+    total_area = sum(max(r.room_spec.target_area_sqm, 1.0) for r in sorted_rooms)
+    weights = [max(r.room_spec.target_area_sqm, 1.0) / total_area for r in sorted_rooms]
+
+    # Recursively subdivide the rectangle
+    bboxes = _treemap_subdivide(weights, 0.0, 0.0, 1.0, 1.0)
+
     placed = []
-    cursor_x = 0.0
-    cursor_y = 0.0
-    row_height = 0.0
+    for i, room in enumerate(sorted_rooms):
+        x_min, y_min, x_max, y_max = bboxes[i]
 
-    for room in sorted_rooms:
-        target_area = room.room_spec.target_area_sqm
-        # Compute room dimensions (roughly square-ish, within plot)
-        aspect = 1.2  # Slightly wider than tall
-        room_h = math.sqrt(target_area / aspect)
-        room_w = target_area / room_h
+        # Clamp to [0, 1]
+        x_min = max(0.0, min(x_min, 1.0))
+        y_min = max(0.0, min(y_min, 1.0))
+        x_max = max(0.0, min(x_max, 1.0))
+        y_max = max(0.0, min(y_max, 1.0))
 
-        # Ensure minimum dimension
-        room_w = max(room_w, 2.4)
-        room_h = max(room_h, 2.4)
-
-        # Check if room fits in current row
-        if cursor_x + room_w > plot_width:
-            # New row
-            cursor_x = 0.0
-            cursor_y += row_height
-            row_height = 0.0
-
-        # Check if room fits vertically
-        if cursor_y + room_h > plot_height:
-            # Scale down to fit
-            room_h = max(plot_height - cursor_y, 2.4)
-            room_w = target_area / room_h
-            room_w = max(room_w, 2.4)
-
-        x_min = cursor_x
-        y_min = cursor_y
-        x_max = min(cursor_x + room_w, plot_width)
-        y_max = min(cursor_y + room_h, plot_height)
+        if x_min >= x_max:
+            x_max = min(x_min + 0.05, 1.0)
+        if y_min >= y_max:
+            y_max = min(y_min + 0.05, 1.0)
 
         bbox = BoundingBox(
-            x_min=x_min / plot_width,
-            y_min=y_min / plot_height,
-            x_max=x_max / plot_width,
-            y_max=y_max / plot_height,
+            x_min=x_min, y_min=y_min,
+            x_max=x_max, y_max=y_max,
         )
-
         placed.append(RoomLayout(
             room_spec=room.room_spec,
             bbox=bbox,
             door_midpoints=room.door_midpoints,
         ))
 
-        cursor_x += room_w
-        row_height = max(row_height, room_h)
-
     result = layout.model_copy(update={
         "rooms": placed,
         "generation_mode": "heuristic",
     })
-    logger.info(f"Heuristic placer: placed {len(placed)} rooms in strip-packing layout")
+    logger.info(f"Heuristic placer: placed {len(placed)} rooms via treemap")
     return result
+
+
+def _treemap_subdivide(
+    weights: list[float],
+    x0: float, y0: float, x1: float, y1: float,
+) -> list[tuple[float, float, float, float]]:
+    """Recursively subdivide a rectangle into slices proportional to weights.
+
+    Uses alternating horizontal/vertical cuts based on rectangle aspect ratio.
+    Returns a list of (x_min, y_min, x_max, y_max) for each weight.
+    """
+    n = len(weights)
+    if n == 0:
+        return []
+    if n == 1:
+        return [(x0, y0, x1, y1)]
+
+    w = x1 - x0
+    h = y1 - y0
+
+    total = sum(weights)
+    if total <= 0:
+        total = 1.0
+
+    # Split into two groups aiming for ~50% area each
+    cumsum = 0.0
+    split_idx = 0
+    half = total / 2.0
+    for i, wt in enumerate(weights):
+        cumsum += wt
+        if cumsum >= half:
+            split_idx = i + 1
+            break
+
+    # Ensure at least one item in each group
+    split_idx = max(1, min(split_idx, n - 1))
+
+    left_weights = weights[:split_idx]
+    right_weights = weights[split_idx:]
+    left_frac = sum(left_weights) / total
+
+    # Choose split direction based on rectangle aspect
+    if w >= h:
+        # Vertical split (left | right)
+        mid_x = x0 + left_frac * w
+        left_bboxes = _treemap_subdivide(left_weights, x0, y0, mid_x, y1)
+        right_bboxes = _treemap_subdivide(right_weights, mid_x, y0, x1, y1)
+    else:
+        # Horizontal split (top / bottom)
+        mid_y = y0 + left_frac * h
+        left_bboxes = _treemap_subdivide(left_weights, x0, y0, x1, mid_y)
+        right_bboxes = _treemap_subdivide(right_weights, x0, mid_y, x1, y1)
+
+    return left_bboxes + right_bboxes
 
 
 # ─── Main Entrypoint ────────────────────────────────────────────────────────
@@ -449,8 +486,8 @@ def run_constraint_pipeline(
     """Run the full constraint-solving pipeline.
 
     Pipeline:
-    1. Z3 hard constraints → if SAT, run soft optimisation → return
-    2. If UNSAT/timeout → heuristic fallback → soft optimisation → return
+    1. Try Z3 hard constraints → if SAT, soft optimise → check quality
+    2. Always fall back to treemap (gap-free) if Z3 produces poor results
     3. Calculate overlap_rate and adjacency_satisfaction
 
     Args:
@@ -459,18 +496,30 @@ def run_constraint_pipeline(
         plot_height: Plot height in metres
 
     Returns:
-        Physically valid LayoutGraph
+        Physically valid LayoutGraph with rooms filling the full plot
     """
+    result = None
+
     # Stage 1: Try Z3
     solved, z3_success = solve_with_z3(layout, plot_width, plot_height)
 
     if z3_success:
         logger.info("Pipeline path: Z3 → Optimise")
-        result = optimise_layout(solved, plot_width, plot_height)
-    else:
-        logger.info("Pipeline path: Heuristic → Optimise")
-        heuristic = heuristic_place(layout, plot_width, plot_height)
-        result = optimise_layout(heuristic, plot_width, plot_height)
+        optimised = optimise_layout(solved, plot_width, plot_height)
+        overlap = _compute_overlap(optimised, plot_width, plot_height)
+
+        if overlap < 0.05:
+            result = optimised
+            logger.info(f"Z3 + Optimise accepted (overlap={overlap:.3f})")
+        else:
+            logger.warning(f"Z3 result rejected (overlap={overlap:.3f}) → treemap")
+
+    # Stage 2: Treemap fallback (gap-free, always works)
+    if result is None:
+        logger.info("Pipeline path: Treemap (gap-free)")
+        result = heuristic_place(layout, plot_width, plot_height)
+        # NOTE: Do NOT run optimise_layout after treemap —
+        # it would move rooms apart and create gaps.
 
     # Calculate metrics
     result = result.model_copy(update={
