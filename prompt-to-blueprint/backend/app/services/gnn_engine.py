@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
@@ -22,11 +22,15 @@ try:
     import torch_geometric
     from torch_geometric.data import Data
     from torch_geometric.nn import GATv2Conv
+
     HAS_PYG = True
 except ImportError:
     HAS_PYG = False
+    GATv2Conv = None  # type: ignore
+    Data = None  # type: ignore
     logger.warning("torch_geometric not installed — GNN features will be limited")
 
+# Import schemas
 from app.models.schemas import (
     AdjacencyEdge,
     BoundingBox,
@@ -48,6 +52,40 @@ EDGE_FEAT_DIM = 3
 HIDDEN_DIM = 128
 NUM_HEADS = 4
 OUTPUT_DIM = 4  # [x_min, y_min, x_max, y_max]
+
+# Room type-specific minimum sizes (as fraction of plot for a standard 10m x 10m plot)
+# These ensure realistic room dimensions based on typical architectural standards
+ROOM_MIN_SIZES: dict[RoomType, tuple[float, float]] = {
+    RoomType.LIVING_ROOM: (0.20, 0.15),  # min 20% width, 15% height
+    RoomType.KITCHEN: (0.12, 0.10),  # min 12% width, 10% height
+    RoomType.MASTER_BEDROOM: (0.18, 0.15),  # min 18% width, 15% height
+    RoomType.BEDROOM: (0.12, 0.12),  # min 12% width, 12% height
+    RoomType.BATHROOM: (0.08, 0.08),  # min 8% width, 8% height
+    RoomType.TOILET: (0.06, 0.06),  # min 6% width, 6% height
+    RoomType.CORRIDOR: (0.04, 0.20),  # min 4% width, 20% height (long narrow)
+    RoomType.BALCONY: (0.10, 0.08),  # min 10% width, 8% height
+    RoomType.STUDY: (0.10, 0.10),  # min 10% width, 10% height
+    RoomType.DINING: (0.12, 0.10),  # min 12% width, 10% height
+    RoomType.UTILITY: (0.08, 0.08),  # min 8% width, 8% height
+    RoomType.GARAGE: (0.15, 0.15),  # min 15% width, 15% height
+}
+
+# Room type aspect ratio preferences (width/height)
+# Helps generate more realistic room shapes
+ROOM_ASPECT_RATIOS: dict[RoomType, tuple[float, float]] = {
+    RoomType.LIVING_ROOM: (1.0, 1.5),  # prefers wider rooms
+    RoomType.KITCHEN: (0.8, 1.3),  # moderately proportioned
+    RoomType.MASTER_BEDROOM: (1.0, 1.4),  # prefers wider rooms
+    RoomType.BEDROOM: (0.9, 1.3),  # slightly rectangular
+    RoomType.BATHROOM: (0.8, 1.2),  # can be square or rectangular
+    RoomType.TOILET: (0.7, 1.0),  # usually small rectangular
+    RoomType.CORRIDOR: (0.2, 0.5),  # very narrow
+    RoomType.BALCONY: (1.5, 4.0),  # long and narrow
+    RoomType.STUDY: (0.9, 1.2),  # roughly square
+    RoomType.DINING: (1.0, 1.5),  # prefers wider
+    RoomType.UTILITY: (0.7, 1.2),  # small rectangular
+    RoomType.GARAGE: (1.0, 1.5),  # rectangular
+}
 
 
 # ─── Model Definition ───────────────────────────────────────────────────────
@@ -73,20 +111,41 @@ class FloorPlanGNN(nn.Module):
         super().__init__()
 
         # GATv2 layers
-        self.conv1 = GATv2Conv(
-            in_channels, hidden_channels, heads=num_heads,
-            concat=True, edge_dim=edge_dim
-        ) if HAS_PYG else None
+        self.conv1 = (
+            GATv2Conv(
+                in_channels,
+                hidden_channels,
+                heads=num_heads,
+                concat=True,
+                edge_dim=edge_dim,
+            )
+            if HAS_PYG
+            else None
+        )
 
-        self.conv2 = GATv2Conv(
-            hidden_channels * num_heads, hidden_channels, heads=num_heads,
-            concat=True, edge_dim=edge_dim
-        ) if HAS_PYG else None
+        self.conv2 = (
+            GATv2Conv(
+                hidden_channels * num_heads,
+                hidden_channels,
+                heads=num_heads,
+                concat=True,
+                edge_dim=edge_dim,
+            )
+            if HAS_PYG
+            else None
+        )
 
-        self.conv3 = GATv2Conv(
-            hidden_channels * num_heads, hidden_channels, heads=num_heads,
-            concat=False, edge_dim=edge_dim
-        ) if HAS_PYG else None
+        self.conv3 = (
+            GATv2Conv(
+                hidden_channels * num_heads,
+                hidden_channels,
+                heads=num_heads,
+                concat=False,
+                edge_dim=edge_dim,
+            )
+            if HAS_PYG
+            else None
+        )
 
         # Edge feature projections
         self.edge_proj1 = nn.Linear(edge_dim, edge_dim)
@@ -100,14 +159,18 @@ class FloorPlanGNN(nn.Module):
 
         # Output heads
         self.bbox_head = nn.Linear(hidden_channels, OUTPUT_DIM)
-        self.door_head = nn.Linear(hidden_channels * 2, 2)  # Concat of two node embeddings
+        self.door_head = nn.Linear(
+            hidden_channels * 2, 2
+        )  # Concat of two node embeddings
 
         # Dropout
         self.dropout = nn.Dropout(0.1)
 
     def forward(
-        self, x: torch.Tensor, edge_index: torch.Tensor,
-        edge_attr: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass.
 
@@ -251,9 +314,7 @@ def parsed_layout_to_pyg(layout: ParsedLayout) -> "Data":
         raise ImportError("torch_geometric is required for parsed_layout_to_pyg")
 
     # Build room_id to index mapping
-    room_id_to_idx = {
-        room.room_id: i for i, room in enumerate(layout.rooms)
-    }
+    room_id_to_idx = {room.room_id: i for i, room in enumerate(layout.rooms)}
 
     # Count adjacencies per room
     adj_counts = {room.room_id: 0 for room in layout.rooms}
@@ -264,10 +325,12 @@ def parsed_layout_to_pyg(layout: ParsedLayout) -> "Data":
             adj_counts[edge.room_b_id] += 1
 
     # Build node features
-    node_features = torch.stack([
-        build_node_features(room, adj_counts.get(room.room_id, 0))
-        for room in layout.rooms
-    ])
+    node_features = torch.stack(
+        [
+            build_node_features(room, adj_counts.get(room.room_id, 0))
+            for room in layout.rooms
+        ]
+    )
 
     # Build edges (bidirectional)
     edge_src, edge_dst = [], []
@@ -301,6 +364,27 @@ def parsed_layout_to_pyg(layout: ParsedLayout) -> "Data":
 # ─── Inference Wrapper ───────────────────────────────────────────────────────
 
 
+# Room type preferred positions on the plot
+# (x_range, y_range) - normalized 0-1 coordinates
+# x: 0=left/front, 1=right/back; y: 0=bottom, 1=top
+ROOM_PREFERRED_ZONES: dict[
+    RoomType, tuple[tuple[float, float], tuple[float, float]]
+] = {
+    RoomType.LIVING_ROOM: ((0.0, 0.7), (0.3, 0.7)),  # Front-center
+    RoomType.KITCHEN: ((0.3, 1.0), (0.0, 0.4)),  # Back-left
+    RoomType.MASTER_BEDROOM: ((0.5, 1.0), (0.5, 1.0)),  # Back-right
+    RoomType.BEDROOM: ((0.0, 1.0), (0.5, 1.0)),  # Back area
+    RoomType.BATHROOM: ((0.2, 0.8), (0.2, 0.8)),  # Middle area
+    RoomType.TOILET: ((0.0, 1.0), (0.1, 0.5)),  # Near entrance area
+    RoomType.CORRIDOR: ((0.3, 0.7), (0.0, 1.0)),  # Center corridor
+    RoomType.BALCONY: ((0.0, 1.0), (0.8, 1.0)),  # Edge/back
+    RoomType.STUDY: ((0.0, 1.0), (0.3, 0.7)),  # Side area
+    RoomType.DINING: ((0.2, 0.8), (0.2, 0.6)),  # Near living/kitchen
+    RoomType.UTILITY: ((0.7, 1.0), (0.0, 0.3)),  # Corner utility
+    RoomType.GARAGE: ((0.0, 0.3), (0.0, 0.3)),  # Front corner
+}
+
+
 def run_gnn_inference(
     parsed_layout: ParsedLayout,
     model_path: str = "models/floorplan_gnn.pt",
@@ -314,7 +398,8 @@ def run_gnn_inference(
     Returns:
         LayoutGraph with predicted room positions
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from app.core.model_registry import ModelRegistry
+    device = ModelRegistry().device
 
     # Load model
     model = FloorPlanGNN()
@@ -345,9 +430,9 @@ def run_gnn_inference(
     else:
         # Fallback without PyG
         N = len(parsed_layout.rooms)
-        x = torch.stack([
-            build_node_features(room) for room in parsed_layout.rooms
-        ]).to(device)
+        x = torch.stack([build_node_features(room) for room in parsed_layout.rooms]).to(
+            device
+        )
         edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
 
         with torch.inference_mode():
@@ -357,36 +442,146 @@ def run_gnn_inference(
     bbox_pred = bbox_pred.cpu()
     bbox_pred = torch.clamp(bbox_pred, 0.0, 1.0)
 
+    # Apply room type position preferences (bias towards typical floor plan locations)
+    position_bias = 0.15  # How much to bias towards preferred positions
+    for i in range(bbox_pred.size(0)):
+        room_type = parsed_layout.rooms[i].room_type
+        preferred = ROOM_PREFERRED_ZONES.get(room_type)
+
+        if preferred:
+            (pref_x_min, pref_x_max), (pref_y_min, pref_y_max) = preferred
+            pref_cx = (pref_x_min + pref_x_max) / 2
+            pref_cy = (pref_y_min + pref_y_max) / 2
+
+            current_cx = (bbox_pred[i, 0] + bbox_pred[i, 2]) / 2
+            current_cy = (bbox_pred[i, 1] + bbox_pred[i, 3]) / 2
+
+            # Blend current position with preferred position
+            new_cx = current_cx * (1 - position_bias) + pref_cx * position_bias
+            new_cy = current_cy * (1 - position_bias) + pref_cy * position_bias
+
+            w = bbox_pred[i, 2] - bbox_pred[i, 0]
+            h = bbox_pred[i, 3] - bbox_pred[i, 1]
+
+            bbox_pred[i, 0] = max(0.0, new_cx - w / 2)
+            bbox_pred[i, 1] = max(0.0, new_cy - h / 2)
+            bbox_pred[i, 2] = min(1.0, new_cx + w / 2)
+            bbox_pred[i, 3] = min(1.0, new_cy + h / 2)
+
     # Ensure x_min < x_max, y_min < y_max
     for i in range(bbox_pred.size(0)):
         if bbox_pred[i, 0] > bbox_pred[i, 2]:
-            bbox_pred[i, 0], bbox_pred[i, 2] = bbox_pred[i, 2].item(), bbox_pred[i, 0].item()
+            bbox_pred[i, 0], bbox_pred[i, 2] = (
+                bbox_pred[i, 2].item(),
+                bbox_pred[i, 0].item(),
+            )
         if bbox_pred[i, 1] > bbox_pred[i, 3]:
-            bbox_pred[i, 1], bbox_pred[i, 3] = bbox_pred[i, 3].item(), bbox_pred[i, 1].item()
+            bbox_pred[i, 1], bbox_pred[i, 3] = (
+                bbox_pred[i, 3].item(),
+                bbox_pred[i, 1].item(),
+            )
 
     # Ensure minimum size (at least 0.05 in normalised coords for a 10m plot = 0.5m)
     min_size = 0.05
+    for i in range(bbox_pred.size(0)):
+        room_type = parsed_layout.rooms[i].room_type
+        room_min = ROOM_MIN_SIZES.get(room_type, (min_size, min_size))
+
+        x_min = float(bbox_pred[i, 0])
+        y_min = float(bbox_pred[i, 1])
+        x_max = float(bbox_pred[i, 2])
+        y_max = float(bbox_pred[i, 3])
+
+        room_min_w, room_min_h = room_min
+        current_w = x_max - x_min
+        current_h = y_max - y_min
+
+        # Apply room-type specific minimum sizes
+        if current_w < room_min_w:
+            cx = (x_min + x_max) / 2.0
+            x_min = max(0.0, cx - room_min_w / 2.0)
+            x_max = min(1.0, cx + room_min_w / 2.0)
+            if x_max - x_min < room_min_w:
+                x_min = max(0.0, x_max - room_min_w)
+                x_max = min(1.0, x_min + room_min_w)
+
+        if current_h < room_min_h:
+            cy = (y_min + y_max) / 2.0
+            y_min = max(0.0, cy - room_min_h / 2.0)
+            y_max = min(1.0, cy + room_min_h / 2.0)
+            if y_max - y_min < room_min_h:
+                y_min = max(0.0, y_max - room_min_h)
+                y_max = min(1.0, y_min + room_min_h)
+
+        bbox_pred[i, 0] = x_min
+        bbox_pred[i, 1] = y_min
+        bbox_pred[i, 2] = x_max
+        bbox_pred[i, 3] = y_max
+
+    # Apply aspect ratio constraints for more realistic room shapes
+    for i in range(bbox_pred.size(0)):
+        room_type = parsed_layout.rooms[i].room_type
+        aspect_range = ROOM_ASPECT_RATIOS.get(room_type, (0.7, 1.5))
+
+        x_min = float(bbox_pred[i, 0])
+        y_min = float(bbox_pred[i, 1])
+        x_max = float(bbox_pred[i, 2])
+        y_max = float(bbox_pred[i, 3])
+
+        current_w = x_max - x_min
+        current_h = y_max - y_min
+        current_aspect = current_w / current_h if current_h > 0 else 1.0
+
+        min_aspect, max_aspect = aspect_range
+
+        # Adjust aspect ratio to be within acceptable range
+        if current_aspect < min_aspect:
+            # Room is too tall - make it wider
+            new_w = current_h * min_aspect
+            cx = (x_min + x_max) / 2.0
+            x_min = max(0.0, cx - new_w / 2.0)
+            x_max = min(1.0, cx + new_w / 2.0)
+        elif current_aspect > max_aspect:
+            # Room is too wide - make it taller
+            new_h = current_w / max_aspect
+            cy = (y_min + y_max) / 2.0
+            y_min = max(0.0, cy - new_h / 2.0)
+            y_max = min(1.0, cy + new_h / 2.0)
+
+        bbox_pred[i, 0] = x_min
+        bbox_pred[i, 1] = y_min
+        bbox_pred[i, 2] = x_max
+        bbox_pred[i, 3] = y_max
+
+    # Apply room spacing for realistic wall thickness (shrink rooms slightly)
+    # This creates gaps between rooms representing wall thickness
+    wall_gap = 0.015  # 1.5% of plot size for walls
     for i in range(bbox_pred.size(0)):
         x_min = float(bbox_pred[i, 0])
         y_min = float(bbox_pred[i, 1])
         x_max = float(bbox_pred[i, 2])
         y_max = float(bbox_pred[i, 3])
 
-        if x_max - x_min < min_size:
-            cx = (x_min + x_max) / 2.0
-            x_min = max(0.0, cx - min_size / 2.0)
-            x_max = min(1.0, cx + min_size / 2.0)
-            if x_max - x_min < min_size:
-                x_min = max(0.0, x_max - min_size)
-                x_max = min(1.0, x_min + min_size)
+        x_min = min(x_min + wall_gap, x_max - wall_gap)
+        y_min = min(y_min + wall_gap, y_max - wall_gap)
+        x_max = max(x_max - wall_gap, x_min + wall_gap)
+        y_max = max(y_max - wall_gap, y_min + wall_gap)
 
-        if y_max - y_min < min_size:
-            cy = (y_min + y_max) / 2.0
-            y_min = max(0.0, cy - min_size / 2.0)
-            y_max = min(1.0, cy + min_size / 2.0)
-            if y_max - y_min < min_size:
-                y_min = max(0.0, y_max - min_size)
-                y_max = min(1.0, y_min + min_size)
+        # Clamp to [0, 1] to ensure valid bounding boxes
+        x_min = max(0.0, min(1.0, x_min))
+        y_min = max(0.0, min(1.0, y_min))
+        x_max = max(0.0, min(1.0, x_max))
+        y_max = max(0.0, min(1.0, y_max))
+
+        # Ensure min size after clamping
+        if x_max - x_min < 0.03:
+            cx = (x_min + x_max) / 2
+            x_min = max(0.0, cx - 0.015)
+            x_max = min(1.0, cx + 0.015)
+        if y_max - y_min < 0.03:
+            cy = (y_min + y_max) / 2
+            y_min = max(0.0, cy - 0.015)
+            y_max = min(1.0, cy + 0.015)
 
         bbox_pred[i, 0] = x_min
         bbox_pred[i, 1] = y_min
@@ -414,11 +609,13 @@ def run_gnn_inference(
                         (float(door_cpu[j, 0]), float(door_cpu[j, 1]))
                     )
 
-        rooms.append(RoomLayout(
-            room_spec=room_spec,
-            bbox=bbox,
-            door_midpoints=door_midpoints,
-        ))
+        rooms.append(
+            RoomLayout(
+                room_spec=room_spec,
+                bbox=bbox,
+                door_midpoints=door_midpoints,
+            )
+        )
 
     return LayoutGraph(
         rooms=rooms,
@@ -462,9 +659,7 @@ def compute_loss(
 
     # Adjacency BCE Loss
     if pred_edges is not None and gt_adjacency is not None:
-        adj_bce = F.binary_cross_entropy(
-            pred_edges[:, 0], gt_adjacency.float()
-        )
+        adj_bce = F.binary_cross_entropy(pred_edges[:, 0], gt_adjacency.float())
     else:
         adj_bce = torch.tensor(0.0, device=pred_bboxes.device)
 
@@ -490,7 +685,9 @@ def _giou_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     inter_y1 = torch.max(pred_y1, gt_y1)
     inter_x2 = torch.min(pred_x2, gt_x2)
     inter_y2 = torch.min(pred_y2, gt_y2)
-    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(
+        inter_y2 - inter_y1, min=0
+    )
 
     # Union
     pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
@@ -513,7 +710,9 @@ def _giou_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     return (1 - giou).mean()
 
 
-def _overlap_loss(bboxes: torch.Tensor, batch_index: torch.Tensor | None = None) -> torch.Tensor:
+def _overlap_loss(
+    bboxes: torch.Tensor, batch_index: torch.Tensor | None = None
+) -> torch.Tensor:
     """Compute pairwise overlap loss between all room pairs within the same graph."""
     N = bboxes.size(0)
     if N < 2:
@@ -528,11 +727,14 @@ def _overlap_loss(bboxes: torch.Tensor, batch_index: torch.Tensor | None = None)
     inter_y1 = torch.max(b1[:, :, 1], b2[:, :, 1])
     inter_x2 = torch.min(b1[:, :, 2], b2[:, :, 2])
     inter_y2 = torch.min(b1[:, :, 3], b2[:, :, 3])
-    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * \
-                 torch.clamp(inter_y2 - inter_y1, min=0)
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(
+        inter_y2 - inter_y1, min=0
+    )
 
     # Sum upper triangle only (avoid double counting + self overlap)
-    mask = torch.triu(torch.ones(N, N, device=bboxes.device, dtype=torch.bool), diagonal=1)
+    mask = torch.triu(
+        torch.ones(N, N, device=bboxes.device, dtype=torch.bool), diagonal=1
+    )
 
     if batch_index is not None:
         # Only penalize overlap for rooms in the SAME graph batch

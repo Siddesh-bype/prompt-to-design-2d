@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import useLayoutStore from '../store/layoutStore';
 import { Stage, Layer, Rect, Transformer, Text as KonvaText } from 'react-konva';
 
@@ -11,9 +11,22 @@ const DRAW_H = CANVAS_SIZE - 2 * PAD;
 /**
  * InteractiveRoom — A single Konva Rect that can be dragged and resized.
  */
-const InteractiveRoom = ({ room, isSelected, onSelect, onChange }) => {
+const InteractiveRoom = ({ room, isSelected, onSelect, onChange, otherRooms }) => {
     const shapeRef = useRef();
     const trRef = useRef();
+    const [liveBox, setLiveBox] = useState(room.bbox);
+    const [isOverlapping, setIsOverlapping] = useState(false);
+
+    // Map [0,1] bbox to [0,DRAW] canvas coords
+    const x = PAD + liveBox.x_min * DRAW_W;
+    const y = PAD + liveBox.y_min * DRAW_H;
+    const width = (liveBox.x_max - liveBox.x_min) * DRAW_W;
+    const height = (liveBox.y_max - liveBox.y_min) * DRAW_H;
+
+    // Dimensions formatter (assume 10m roughly)
+    const w_m = (liveBox.x_max - liveBox.x_min) * 10;
+    const h_m = (liveBox.y_max - liveBox.y_min) * 10;
+    const formatDisplay = (w, h) => `${w.toFixed(1)}m × ${h.toFixed(1)}m`;
 
     useEffect(() => {
         if (isSelected && trRef.current) {
@@ -22,14 +35,67 @@ const InteractiveRoom = ({ room, isSelected, onSelect, onChange }) => {
         }
     }, [isSelected]);
 
-    // Map [0,1] bbox to [0,800] canvas coords
-    const x = PAD + room.bbox.x_min * DRAW_W;
-    const y = PAD + room.bbox.y_min * DRAW_H;
-    const width = (room.bbox.x_max - room.bbox.x_min) * DRAW_W;
-    const height = (room.bbox.y_max - room.bbox.y_min) * DRAW_H;
+    // Update liveBox when room prop changes (e.g. from backend regenerations)
+    useEffect(() => {
+        setLiveBox(room.bbox);
+    }, [room.bbox]);
 
-    // Label
+    const checkOverlap = (box, others) => {
+        for (const other of others) {
+            const ob = other.bbox;
+            // AABB Overlap check with small epsilon
+            const eps = 0.02;
+            if (
+                box.x_min < ob.x_max - eps &&
+                box.x_max > ob.x_min + eps &&
+                box.y_min < ob.y_max - eps &&
+                box.y_max > ob.y_min + eps
+            ) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const handleUpdate = (node, isFinal = false) => {
+        // Apply 10px snap grid (approx 0.15m)
+        const snap = 10;
+        const snappedX = Math.round(node.x() / snap) * snap;
+        const snappedY = Math.round(node.y() / snap) * snap;
+        const snappedW = Math.round(node.width() * node.scaleX() / snap) * snap;
+        const snappedH = Math.round(node.height() * node.scaleY() / snap) * snap;
+
+        // Don't apply snapping to the node itself during drag to avoid stutter,
+        // but snap the model coordinates.
+        const newXMin = Math.max(0, (snappedX - PAD) / DRAW_W);
+        const newYMin = Math.max(0, (snappedY - PAD) / DRAW_H);
+        const newXMax = Math.min(1, newXMin + snappedW / DRAW_W);
+        const newYMax = Math.min(1, newYMin + snappedH / DRAW_H);
+
+        const newBox = { x_min: newXMin, y_min: newYMin, x_max: newXMax, y_max: newYMax, area: (newXMax - newXMin) * (newYMax - newYMin) };
+
+        setLiveBox(newBox);
+        const overlap = checkOverlap(newBox, otherRooms);
+        setIsOverlapping(overlap);
+
+        if (isFinal) {
+            // Reset node to model position to enforce snap
+            node.setAttrs({
+                x: PAD + newXMin * DRAW_W,
+                y: PAD + newYMin * DRAW_H,
+                width: (newXMax - newXMin) * DRAW_W,
+                height: (newYMax - newYMin) * DRAW_H,
+                scaleX: 1,
+                scaleY: 1
+            });
+            onChange({ ...room, bbox: newBox });
+        }
+    };
+
     const label = room.room_spec?.label || room.room_spec?.room_type?.replace(/_/g, ' ') || 'Room';
+
+    // Styling based on state
+    const baseColor = isOverlapping ? '239, 68, 68' : '59, 130, 246'; // Red if overlap, Blue if OK
 
     return (
         <React.Fragment>
@@ -39,55 +105,27 @@ const InteractiveRoom = ({ room, isSelected, onSelect, onChange }) => {
                 y={y}
                 width={width}
                 height={height}
-                fill="rgba(59, 130, 246, 0.4)" // blueprint-500 with opacity
-                stroke="rgba(37, 99, 235, 0.8)"
-                strokeWidth={2}
+                fill={`rgba(${baseColor}, ${isOverlapping ? 0.6 : 0.4})`}
+                stroke={`rgba(${baseColor}, 0.8)`}
+                strokeWidth={isOverlapping ? 3 : 2}
                 draggable
                 onClick={onSelect}
                 onTap={onSelect}
                 onDragStart={onSelect}
-                onDragEnd={(e) => {
-                    const node = shapeRef.current;
-                    const newXMin = (node.x() - PAD) / DRAW_W;
-                    const newYMin = (node.y() - PAD) / DRAW_H;
-                    const newXMax = newXMin + node.width() / DRAW_W;
-                    const newYMax = newYMin + node.height() / DRAW_H;
-                    onChange({
-                        ...room,
-                        bbox: { x_min: newXMin, y_min: newYMin, x_max: newXMax, y_max: newYMax, area: (newXMax - newXMin) * (newYMax - newYMin) }
-                    });
-                }}
-                onTransformEnd={(e) => {
-                    const node = shapeRef.current;
-                    const scaleX = node.scaleX();
-                    const scaleY = node.scaleY();
-
-                    // Reset scale to 1 after transform to keep border clean, update width/height
-                    node.scaleX(1);
-                    node.scaleY(1);
-
-                    const newWidth = Math.max(5, node.width() * scaleX);
-                    const newHeight = Math.max(5, node.height() * scaleY);
-
-                    const newXMin = (node.x() - PAD) / DRAW_W;
-                    const newYMin = (node.y() - PAD) / DRAW_H;
-                    const newXMax = newXMin + newWidth / DRAW_W;
-                    const newYMax = newYMin + newHeight / DRAW_H;
-
-                    onChange({
-                        ...room,
-                        bbox: { x_min: newXMin, y_min: newYMin, x_max: newXMax, y_max: newYMax, area: (newXMax - newXMin) * (newYMax - newYMin) }
-                    });
-                }}
+                onDragMove={(e) => handleUpdate(shapeRef.current, false)}
+                onDragEnd={(e) => handleUpdate(shapeRef.current, true)}
+                onTransform={(e) => handleUpdate(shapeRef.current, false)}
+                onTransformEnd={(e) => handleUpdate(shapeRef.current, true)}
             />
-            {/* Dimensions overlay label */}
-            {isSelected && (
+            {/* Overlay label and live dimensions */}
+            {(isSelected || isOverlapping) && (
                 <KonvaText
                     x={x + 5}
                     y={y + 5}
-                    text={label}
-                    fontSize={12}
-                    fill="#1E293B"
+                    text={`${label}\n${formatDisplay(w_m, h_m)}${isOverlapping ? '\n❌ OVERLAP' : ''}`}
+                    fontSize={11}
+                    lineHeight={1.4}
+                    fill={isOverlapping ? "#7F1D1D" : "#1E293B"} // Dark red if overlapping
                     fontStyle="bold"
                     listening={false}
                 />
@@ -96,15 +134,12 @@ const InteractiveRoom = ({ room, isSelected, onSelect, onChange }) => {
                 <Transformer
                     ref={trRef}
                     boundBoxFunc={(oldBox, newBox) => {
-                        // Limit minimum size
-                        if (newBox.width < 20 || newBox.height < 20) {
-                            return oldBox;
-                        }
+                        if (newBox.width < 30 || newBox.height < 30) return oldBox;
                         return newBox;
                     }}
                     rotateEnabled={false}
-                    borderStroke="#2563EB"
-                    anchorStroke="#2563EB"
+                    borderStroke={`rgba(${baseColor}, 1)`}
+                    anchorStroke={`rgba(${baseColor}, 1)`}
                     anchorFill="#FFFFFF"
                     anchorSize={8}
                 />
@@ -262,7 +297,7 @@ export default function CanvasEditor() {
 
             {/* SVG container */}
             <div
-                className="absolute inset-0 flex items-center justify-center pointer-events-none"
+                className="absolute inset-0 flex items-center justify-center"
             >
                 {/* Wrap both SVG and Konva in the same transforming container */}
                 <div
@@ -272,13 +307,12 @@ export default function CanvasEditor() {
                         width: `${CANVAS_SIZE}px`,
                         height: `${CANVAS_SIZE}px`,
                         position: 'relative',
-                        pointerEvents: isEditMode ? 'auto' : 'none', // Konva intercepts clicks in edit mode
                     }}
                 >
                     {svgString ? (
                         <div
                             ref={svgRef}
-                            className={`transition-opacity duration-300 w-full h-full absolute inset-0 ${isEditMode ? 'opacity-50' : 'opacity-100'} pointer-events-auto`}
+                            className={`transition-opacity duration-300 w-full h-full absolute inset-0 ${isEditMode ? 'opacity-50 pointer-events-none' : 'opacity-100'}`}
                             dangerouslySetInnerHTML={{ __html: svgString }}
                         />
                     ) : (
@@ -312,6 +346,7 @@ export default function CanvasEditor() {
                                             isSelected={room.room_spec?.room_id === selectedRoomId}
                                             onSelect={() => setSelectedRoomId(room.room_spec?.room_id)}
                                             onChange={(newAttrs) => handleRoomChange(i, newAttrs)}
+                                            otherRooms={layout.rooms.filter((_, idx) => idx !== i)}
                                         />
                                     ))}
                                 </Layer>

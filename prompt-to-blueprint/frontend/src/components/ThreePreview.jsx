@@ -44,6 +44,17 @@ const WALL_HEIGHT_MAP = {
     CORRIDOR: 2.8,
 };
 
+// Floor patterns - true = has special texture
+const FLOOR_PATTERN = {
+    BATHROOM: 'tile',
+    TOILET: 'tile',
+    KITCHEN: 'tile',
+    MASTER_BEDROOM: 'wood',
+    BEDROOM: 'wood',
+    LIVING_ROOM: 'carpet',
+    BALCONY: 'outdoor',
+};
+
 const FLOOR_COLORS = {
     LIVING_ROOM: '#CBD5E1',
     KITCHEN: '#FEF3C7',
@@ -59,7 +70,105 @@ const FLOOR_COLORS = {
     GARAGE: '#E2E8F0',
 };
 
-// ─── Wall Panel Helper ──────────────────────────────────────────
+// ─── Floor with Pattern ──────────────────────────────────────────
+function FloorWithPattern({ w, d, floorColor, patternType }) {
+    if (!patternType || patternType === 'plain') {
+        return (
+            <meshStandardMaterial color={floorColor} roughness={0.8} />
+        );
+    }
+
+    switch (patternType) {
+        case 'tile':
+            return (
+                <meshStandardMaterial color={floorColor} roughness={0.6} />
+            );
+        case 'wood':
+            return (
+                <meshStandardMaterial color="#D4B896" roughness={0.7} metalness={0.1} />
+            );
+        case 'carpet':
+            return (
+                <meshStandardMaterial color={floorColor} roughness={0.95} />
+            );
+        case 'outdoor':
+            return (
+                <meshStandardMaterial color="#A8D5BA" roughness={0.9} />
+            );
+        default:
+            return (
+                <meshStandardMaterial color={floorColor} roughness={0.8} />
+            );
+    }
+}
+
+// ─── Ceiling Light ────────────────────────────────────────────────
+function CeilingLight({ position }) {
+    return (
+        <group position={position}>
+            {/* Light fixture */}
+            <mesh>
+                <cylinderGeometry args={[0.15, 0.12, 0.08, 8]} />
+                <meshStandardMaterial color="#F8FAFC" roughness={0.3} />
+            </mesh>
+            {/* Light glow */}
+            <pointLight intensity={0.5} distance={3} color="#FEF3C7" />
+        </group>
+    );
+}
+
+// ─── Ceiling Fan ─────────────────────────────────────────────────
+function CeilingFan({ position, isHovered }) {
+    const fanRef = useRef();
+    
+    useFrame(() => {
+        if (fanRef.current && isHovered) {
+            fanRef.current.rotation.y += 0.15;
+        }
+    });
+
+    return (
+        <group position={position}>
+            {/* Mount */}
+            <mesh>
+                <cylinderGeometry args={[0.05, 0.05, 0.15, 8]} />
+                <meshStandardMaterial color="#374151" roughness={0.5} />
+            </mesh>
+            {/* Fan blades */}
+            <group ref={fanRef} position={[0, -0.1, 0]}>
+                {[0, 1, 2, 3].map((i) => (
+                    <mesh key={i} position={[Math.cos(i * Math.PI / 2) * 0.35, 0, Math.sin(i * Math.PI / 2) * 0.35]} rotation={[0, -i * Math.PI / 2, 0]}>
+                        <boxGeometry args={[0.6, 0.02, 0.12]} />
+                        <meshStandardMaterial color="#E2E8F0" roughness={0.4} />
+                    </mesh>
+                ))}
+            </group>
+        </group>
+    );
+}
+
+// ─── Wall Outlet ─────────────────────────────────────────────────
+function WallOutlet({ position }) {
+    return (
+        <group position={position}>
+            <mesh>
+                <boxGeometry args={[0.06, 0.08, 0.02]} />
+                <meshStandardMaterial color="#F8FAFC" roughness={0.5} />
+            </mesh>
+            {/* Two slots */}
+            <mesh position={[0.01, 0.015, 0.011]}>
+                <boxGeometry args={[0.015, 0.025, 0.001]} />
+                <meshStandardMaterial color="#1E293B" />
+            </mesh>
+            <mesh position={[0.01, -0.015, 0.011]}>
+                <boxGeometry args={[0.015, 0.015, 0.001]} />
+                <meshStandardMaterial color="#1E293B" />
+            </mesh>
+        </group>
+    );
+}
+
+// ─── Room Furniture ─────────────────────────────────────────────
 function WallPanel({ w, h, d, position, color }) {
     return (
         <mesh position={position} castShadow receiveShadow>
@@ -95,7 +204,7 @@ function WindowPane({ position, rotation }) {
 }
 
 // ─── Room Furniture ─────────────────────────────────────────────
-function Furniture({ roomType, w, d }) {
+function Furniture({ roomType, w, d, isHovered }) {
     const color = ROOM_COLORS[roomType] || '#94A3B8';
     const dark = '#374151';
 
@@ -104,6 +213,7 @@ function Furniture({ roomType, w, d }) {
         case 'BEDROOM': {
             const bw = Math.min(1.8, w * 0.6);
             const bd = Math.min(2.0, d * 0.65);
+            const hasRoom = w > 2.5 && d > 2.5;
             return (
                 <group>
                     {/* Bed base */}
@@ -125,12 +235,48 @@ function Furniture({ roomType, w, d }) {
                         <boxGeometry args={[bw * 0.35, 0.08, 0.5]} />
                         <meshStandardMaterial color="#FFFFFF" roughness={0.9} />
                     </mesh>
+                    {/* Nightstand left */}
+                    {hasRoom && w > 3 && (
+                        <mesh position={[-bw / 2 - 0.4, 0.25, -bd / 2 + 0.3]} castShadow>
+                            <boxGeometry args={[0.4, 0.5, 0.35]} />
+                            <meshStandardMaterial color="#92400E" roughness={0.7} />
+                        </mesh>
+                    )}
+                    {/* Nightstand right */}
+                    {hasRoom && w > 3 && (
+                        <mesh position={[bw / 2 + 0.4, 0.25, -bd / 2 + 0.3]} castShadow>
+                            <boxGeometry args={[0.4, 0.5, 0.35]} />
+                            <meshStandardMaterial color="#92400E" roughness={0.7} />
+                        </mesh>
+                    )}
+                    {/* TV */}
+                    {w > 3 && (
+                        <group position={[w * 0.3, 0.5, -d * 0.3]}>
+                            <mesh castShadow>
+                                <boxGeometry args={[0.8, 0.5, 0.08]} />
+                                <meshStandardMaterial color="#1E293B" roughness={0.5} />
+                            </mesh>
+                            {/* TV Stand */}
+                            <mesh position={[0, -0.35, 0.1]} castShadow>
+                                <boxGeometry args={[0.9, 0.3, 0.3]} />
+                                <meshStandardMaterial color="#374151" roughness={0.7} />
+                            </mesh>
+                        </group>
+                    )}
+                    {/* Wardrobe */}
+                    {w > 3.5 && (
+                        <mesh position={[w * 0.35, 0.9, d * 0.2]} castShadow>
+                            <boxGeometry args={[1.2, 1.8, 0.5]} />
+                            <meshStandardMaterial color="#78716C" roughness={0.8} />
+                        </mesh>
+                    )}
                 </group>
             );
         }
         case 'LIVING_ROOM': {
             const sw = Math.min(2.0, w * 0.6);
             const sd = 0.8;
+            const hasRoom = w > 2.5 && d > 2.5;
             return (
                 <group>
                     {/* Sofa base */}
@@ -152,11 +298,46 @@ function Furniture({ roomType, w, d }) {
                         <boxGeometry args={[0.9, 0.18, 0.5]} />
                         <meshStandardMaterial color="#A3A3A3" roughness={0.9} />
                     </mesh>
+                    {/* TV Unit */}
+                    {hasRoom && w > 3 && (
+                        <group position={[w * 0.3, 0.2, -d * 0.35]}>
+                            <mesh castShadow receiveShadow>
+                                <boxGeometry args={[1.2, 0.4, 0.35]} />
+                                <meshStandardMaterial color="#292524" roughness={0.7} />
+                            </mesh>
+                            {/* TV */}
+                            <mesh position={[0, 0.45, -0.05]} castShadow>
+                                <boxGeometry args={[0.9, 0.55, 0.05]} />
+                                <meshStandardMaterial color="#0F172A" roughness={0.3} metalness={0.5} />
+                            </mesh>
+                        </group>
+                    )}
+                    {/* Side chairs */}
+                    {hasRoom && w > 4 && d > 3 && (
+                        <>
+                            <mesh position={[-sw / 2 - 0.5, 0.3, 0]} castShadow>
+                                <boxGeometry args={[0.45, 0.5, 0.45]} />
+                                <meshStandardMaterial color="#78350F" roughness={0.8} />
+                            </mesh>
+                            <mesh position={[sw / 2 + 0.5, 0.3, 0]} castShadow>
+                                <boxGeometry args={[0.45, 0.5, 0.45]} />
+                                <meshStandardMaterial color="#78350F" roughness={0.8} />
+                            </mesh>
+                        </>
+                    )}
+                    {/* AC Unit */}
+                    {hasRoom && (
+                        <mesh position={[-w * 0.35, 2.5, -d * 0.45]} castShadow>
+                            <boxGeometry args={[0.7, 0.25, 0.2]} />
+                            <meshStandardMaterial color="#F1F5F9" roughness={0.4} metalness={0.3} />
+                        </mesh>
+                    )}
                 </group>
             );
         }
         case 'KITCHEN': {
             const cw = Math.min(w * 0.8, 2.4);
+            const hasRoom = w > 2.5 && d > 2.5;
             return (
                 <group>
                     {/* Counter top */}
@@ -183,11 +364,33 @@ function Furniture({ roomType, w, d }) {
                         <boxGeometry args={[0.5, 0.03, 0.4]} />
                         <meshStandardMaterial color="#94A3B8" roughness={0.3} metalness={0.5} />
                     </mesh>
+                    {/* Refrigerator */}
+                    {hasRoom && w > 3 && (
+                        <mesh position={[-w * 0.35, 0.9, d * 0.2]} castShadow>
+                            <boxGeometry args={[0.7, 1.7, 0.65]} />
+                            <meshStandardMaterial color="#E2E8F0" roughness={0.4} metalness={0.6} />
+                        </mesh>
+                    )}
+                    {/* Microwave */}
+                    {hasRoom && (
+                        <mesh position={[cw * 0.3, 1.15, -d * 0.35]} castShadow>
+                            <boxGeometry args={[0.4, 0.25, 0.3]} />
+                            <meshStandardMaterial color="#1E293B" roughness={0.3} metalness={0.5} />
+                        </mesh>
+                    )}
+                    {/* Dishwasher */}
+                    {hasRoom && d > 3 && (
+                        <mesh position={[cw * 0.5, 0.35, d * 0.3]} castShadow>
+                            <boxGeometry args={[0.5, 0.6, 0.55]} />
+                            <meshStandardMaterial color="#F1F5F9" roughness={0.5} />
+                        </mesh>
+                    )}
                 </group>
             );
         }
         case 'BATHROOM':
         case 'TOILET': {
+            const hasRoom = w > 2 && d > 2;
             return (
                 <group>
                     {/* Toilet bowl */}
@@ -210,10 +413,25 @@ function Furniture({ roomType, w, d }) {
                         <boxGeometry args={[0.4, 0.06, 0.35]} />
                         <meshStandardMaterial color="white" roughness={0.1} />
                     </mesh>
+                    {/* Bathtub */}
+                    {roomType === 'BATHROOM' && hasRoom && w > 2.5 && d > 2.5 && (
+                        <mesh position={[-w * 0.25, 0.35, d * 0.25]} castShadow receiveShadow>
+                            <boxGeometry args={[0.75, 0.5, 1.7]} />
+                            <meshStandardMaterial color="white" roughness={0.15} />
+                        </mesh>
+                    )}
+                    {/* Medicine Cabinet */}
+                    {hasRoom && (
+                        <mesh position={[w * 0.35, 1.5, -d * 0.45]} castShadow>
+                            <boxGeometry args={[0.4, 0.5, 0.08]} />
+                            <meshStandardMaterial color="#F8FAFC" roughness={0.5} metalness={0.3} />
+                        </mesh>
+                    )}
                 </group>
             );
         }
         case 'DINING': {
+            const hasRoom = w > 2.5 && d > 2.5;
             return (
                 <group>
                     {/* Table */}
@@ -239,10 +457,18 @@ function Furniture({ roomType, w, d }) {
                             </mesh>
                         </group>
                     ))}
+                    {/* Sideboard */}
+                    {hasRoom && (
+                        <mesh position={[-w * 0.35, 0.4, d * 0.3]} castShadow>
+                            <boxGeometry args={[0.8, 0.75, 0.4]} />
+                            <meshStandardMaterial color="#78350F" roughness={0.7} />
+                        </mesh>
+                    )}
                 </group>
             );
         }
         case 'STUDY': {
+            const hasRoom = w > 2 && d > 2;
             return (
                 <group>
                     <mesh position={[0, 0.75, 0]} castShadow receiveShadow>
@@ -258,6 +484,55 @@ function Furniture({ roomType, w, d }) {
                         <boxGeometry args={[0.5, 0.33, 0.04]} />
                         <meshStandardMaterial color="#1E293B" roughness={0.5} />
                     </mesh>
+                    {/* Bookshelf */}
+                    {hasRoom && w > 2.5 && (
+                        <mesh position={[-w * 0.35, 0.9, d * 0.25]} castShadow>
+                            <boxGeometry args={[0.6, 1.6, 0.35]} />
+                            <meshStandardMaterial color="#78350F" roughness={0.8} />
+                        </mesh>
+                    )}
+                    {/* Computer */}
+                    {hasRoom && (
+                        <mesh position={[w * 0.2, 0.85, 0]} castShadow>
+                            <boxGeometry args={[0.35, 0.25, 0.02]} />
+                            <meshStandardMaterial color="#0F172A" roughness={0.3} />
+                        </mesh>
+                    )}
+                </group>
+            );
+        }
+        case 'BALCONY': {
+            return (
+                <group>
+                    {/* Railing */}
+                    <mesh position={[0, 0.6, -d / 2 + 0.05]} castShadow>
+                        <boxGeometry args={[w * 0.95, 0.05, 0.05]} />
+                        <meshStandardMaterial color="#78716C" roughness={0.6} />
+                    </mesh>
+                    <mesh position={[0, 0.9, -d / 2 + 0.05]} castShadow>
+                        <boxGeometry args={[w * 0.95, 0.05, 0.05]} />
+                        <meshStandardMaterial color="#78716C" roughness={0.6} />
+                    </mesh>
+                    {/* Railing posts */}
+                    {[-w * 0.4, 0, w * 0.4].map((px, i) => (
+                        <mesh key={i} position={[px, 0.75, -d / 2 + 0.05]} castShadow>
+                            <boxGeometry args={[0.04, 0.5, 0.04]} />
+                            <meshStandardMaterial color="#57534E" roughness={0.7} />
+                        </mesh>
+                    ))}
+                    {/* Plants */}
+                    {w > 2 && (
+                        <>
+                            <mesh position={[-w * 0.35, 0.15, -d * 0.3]} castShadow>
+                                <cylinderGeometry args={[0.12, 0.1, 0.3, 8]} />
+                                <meshStandardMaterial color="#78350F" roughness={0.8} />
+                            </mesh>
+                            <mesh position={[w * 0.35, 0.15, -d * 0.3]} castShadow>
+                                <cylinderGeometry args={[0.12, 0.1, 0.3, 8]} />
+                                <meshStandardMaterial color="#78350F" roughness={0.8} />
+                            </mesh>
+                        </>
+                    )}
                 </group>
             );
         }
@@ -292,10 +567,12 @@ function Room({ bbox, roomType, label, plotWidth, plotHeight, isHovered, onHover
     // Window positions: one per long wall at mid-height
     const wh = wallHeight;
     const winY = wh * 0.6; // 60% up the wall
+    const floorPattern = FLOOR_PATTERN[roomType] || null;
+    const hasRoom = w > 2.5 && d > 2.5;
 
     return (
         <group ref={meshRef} position={[x, 0, z]}>
-            {/* ── Floor tile ── */}
+            {/* ── Floor with pattern ── */}
             <mesh
                 position={[0, FLOOR_OFFSET, 0]}
                 rotation={[-Math.PI / 2, 0, 0]}
@@ -304,7 +581,7 @@ function Room({ bbox, roomType, label, plotWidth, plotHeight, isHovered, onHover
                 onPointerLeave={(e) => { e.stopPropagation(); onHover(false); }}
             >
                 <planeGeometry args={[w, d]} />
-                <meshStandardMaterial color={floorColor} roughness={0.8} />
+                <FloorWithPattern w={w} d={d} floorColor={floorColor} patternType={floorPattern} />
             </mesh>
 
             {/* ── Four walls (North, South, East, West) ── */}
@@ -329,6 +606,16 @@ function Room({ bbox, roomType, label, plotWidth, plotHeight, isHovered, onHover
                 />
             </mesh>
 
+            {/* ── Ceiling Light ── */}
+            {hasRoom && (
+                <CeilingLight position={[w * 0.2, wh - 0.05, d * 0.2]} />
+            )}
+
+            {/* ── Ceiling Fan (Bedrooms & Living) ── */}
+            {['MASTER_BEDROOM', 'BEDROOM', 'LIVING_ROOM'].includes(roomType) && hasRoom && (
+                <CeilingFan position={[0, wh - 0.1, 0]} isHovered={isHovered} />
+            )}
+
             {/* ── Window on North wall (except BATHROOM/TOILET/CORRIDOR) ── */}
             {!['BATHROOM', 'TOILET', 'CORRIDOR'].includes(roomType) && w >= 2.5 && (
                 <WindowPane
@@ -338,7 +625,7 @@ function Room({ bbox, roomType, label, plotWidth, plotHeight, isHovered, onHover
             )}
 
             {/* ── Furniture ── */}
-            <Furniture roomType={roomType} w={w} d={d} />
+            <Furniture roomType={roomType} w={w} d={d} isHovered={isHovered} />
 
             {/* ── Room label (visible when hovered or always) ── */}
             <Text

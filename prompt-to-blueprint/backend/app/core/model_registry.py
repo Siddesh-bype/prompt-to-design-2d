@@ -46,11 +46,16 @@ class ModelRegistry:
             return
         self._initialised = True
         self._models: dict[str, torch.nn.Module] = {}
-        self._device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        # Automatically fallback to CPU for Intel/AMD without NVIDIA
+        if torch.cuda.is_available():
+            self._device = torch.device("cuda")
+            device_msg = "CUDA (NVIDIA GPU)"
+        else:
+            self._device = torch.device("cpu")
+            device_msg = "CPU (Intel iGPU / No NVIDIA GPU detected)"
+
         self._vram_allocated_mb: float = 0.0
-        logger.info(f"ModelRegistry initialised on device: {self._device}")
+        logger.info(f"ModelRegistry initialised on device: {device_msg}")
 
     @property
     def device(self) -> torch.device:

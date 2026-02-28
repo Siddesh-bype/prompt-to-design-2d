@@ -22,27 +22,39 @@ from app.models.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# Architectural constants
+DOOR_TOLERANCE = 0.015  # wall proximity threshold for door placement
+MIN_OVERLAP_FOR_DOOR = 0.02  # minimum wall overlap for valid door
+MIN_DOOR_WALL_LENGTH_M = 0.9  # minimum door wall length in metres
+
 # Try to import optional dependencies
 try:
-    import z3
+    import z3  # type: ignore
+
     HAS_Z3 = True
 except ImportError:
     HAS_Z3 = False
+    z3 = None  # type: ignore
     logger.warning("z3-solver not installed — Z3 constraint solving disabled")
 
 try:
-    from shapely.geometry import box as shapely_box
-    from shapely.geometry import Polygon
+    from shapely.geometry import box as shapely_box  # type: ignore
+    from shapely.geometry import Polygon  # type: ignore
+
     HAS_SHAPELY = True
 except ImportError:
     HAS_SHAPELY = False
+    shapely_box = None  # type: ignore
+    Polygon = None  # type: ignore
     logger.warning("shapely not installed — geometric optimisation limited")
 
 try:
-    from scipy.optimize import minimize as scipy_minimize
+    from scipy.optimize import minimize as scipy_minimize  # type: ignore
+
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
+    scipy_minimize = None  # type: ignore
     logger.warning("scipy not installed — soft optimisation disabled")
 
 
@@ -121,12 +133,14 @@ def solve_with_z3(
         for j in range(i + 1, n_rooms):
             v_i = vars_dict[room_ids[i]]
             v_j = vars_dict[room_ids[j]]
-            solver.add(z3.Or(
-                v_i["x_max"] <= v_j["x_min"],  # i is left of j
-                v_j["x_max"] <= v_i["x_min"],  # j is left of i
-                v_i["y_max"] <= v_j["y_min"],  # i is above j
-                v_j["y_max"] <= v_i["y_min"],  # j is above i
-            ))
+            solver.add(
+                z3.Or(
+                    v_i["x_max"] <= v_j["x_min"],  # i is left of j
+                    v_j["x_max"] <= v_i["x_min"],  # j is left of i
+                    v_i["y_max"] <= v_j["y_min"],  # i is above j
+                    v_j["y_max"] <= v_i["y_min"],  # j is above i
+                )
+            )
 
     # Constraint 5: Required adjacencies share wall >= 0.9m
     shared_wall_min = 0.9
@@ -145,23 +159,25 @@ def solve_with_z3(
 
         h_overlap = z3.If(
             z3.And(v_a["y_min"] < v_b["y_max"], v_b["y_min"] < v_a["y_max"]),
-            z3.If(v_a["y_max"] < v_b["y_max"], v_a["y_max"], v_b["y_max"]) -
-            z3.If(v_a["y_min"] > v_b["y_min"], v_a["y_min"], v_b["y_min"]),
+            z3.If(v_a["y_max"] < v_b["y_max"], v_a["y_max"], v_b["y_max"])
+            - z3.If(v_a["y_min"] > v_b["y_min"], v_a["y_min"], v_b["y_min"]),
             0,
         )
         v_overlap = z3.If(
             z3.And(v_a["x_min"] < v_b["x_max"], v_b["x_min"] < v_a["x_max"]),
-            z3.If(v_a["x_max"] < v_b["x_max"], v_a["x_max"], v_b["x_max"]) -
-            z3.If(v_a["x_min"] > v_b["x_min"], v_a["x_min"], v_b["x_min"]),
+            z3.If(v_a["x_max"] < v_b["x_max"], v_a["x_max"], v_b["x_max"])
+            - z3.If(v_a["x_min"] > v_b["x_min"], v_a["x_min"], v_b["x_min"]),
             0,
         )
 
-        solver.add(z3.Or(
-            z3.And(v_a["x_max"] == v_b["x_min"], h_overlap >= shared_wall_min),
-            z3.And(v_b["x_max"] == v_a["x_min"], h_overlap >= shared_wall_min),
-            z3.And(v_a["y_max"] == v_b["y_min"], v_overlap >= shared_wall_min),
-            z3.And(v_b["y_max"] == v_a["y_min"], v_overlap >= shared_wall_min),
-        ))
+        solver.add(
+            z3.Or(
+                z3.And(v_a["x_max"] == v_b["x_min"], h_overlap >= shared_wall_min),
+                z3.And(v_b["x_max"] == v_a["x_min"], h_overlap >= shared_wall_min),
+                z3.And(v_a["y_max"] == v_b["y_min"], v_overlap >= shared_wall_min),
+                z3.And(v_b["y_max"] == v_a["y_min"], v_overlap >= shared_wall_min),
+            )
+        )
 
     # Solve
     result = solver.check()
@@ -184,11 +200,13 @@ def solve_with_z3(
                 x_max=x_max / plot_width,
                 y_max=y_max / plot_height,
             )
-            new_rooms.append(RoomLayout(
-                room_spec=room.room_spec,
-                bbox=bbox,
-                door_midpoints=room.door_midpoints,
-            ))
+            new_rooms.append(
+                RoomLayout(
+                    room_spec=room.room_spec,
+                    bbox=bbox,
+                    door_midpoints=room.door_midpoints,
+                )
+            )
 
         solved = layout.model_copy(update={"rooms": new_rooms})
         logger.info("Z3 solver: SAT — constraints satisfied")
@@ -235,33 +253,46 @@ def optimise_layout(
     x0 = []
     for room in layout.rooms:
         b = room.bbox
-        x0.extend([
-            b.x_min * plot_width, b.y_min * plot_height,
-            b.x_max * plot_width, b.y_max * plot_height,
-        ])
+        x0.extend(
+            [
+                b.x_min * plot_width,
+                b.y_min * plot_height,
+                b.x_max * plot_width,
+                b.y_max * plot_height,
+            ]
+        )
 
     bounds = []
     for _ in range(n):
-        bounds.extend([
-            (0, plot_width), (0, plot_height),
-            (0, plot_width), (0, plot_height),
-        ])
+        bounds.extend(
+            [
+                (0, plot_width),
+                (0, plot_height),
+                (0, plot_width),
+                (0, plot_height),
+            ]
+        )
 
     def objective(x):
         cost = 0.0
         rooms_data = []
         for i in range(n):
-            x_min, y_min = x[4*i], x[4*i+1]
-            x_max, y_max = x[4*i+2], x[4*i+3]
+            x_min, y_min = x[4 * i], x[4 * i + 1]
+            x_max, y_max = x[4 * i + 2], x[4 * i + 3]
             cx = (x_min + x_max) / 2
             cy = (y_min + y_max) / 2
-            rooms_data.append({
-                "type": layout.rooms[i].room_spec.room_type,
-                "x_min": x_min, "y_min": y_min,
-                "x_max": x_max, "y_max": y_max,
-                "cx": cx, "cy": cy,
-                "area": max((x_max - x_min) * (y_max - y_min), 0.01),
-            })
+            rooms_data.append(
+                {
+                    "type": layout.rooms[i].room_spec.room_type,
+                    "x_min": x_min,
+                    "y_min": y_min,
+                    "x_max": x_max,
+                    "y_max": y_max,
+                    "cx": cx,
+                    "cy": cy,
+                    "area": max((x_max - x_min) * (y_max - y_min), 0.01),
+                }
+            )
 
         # Natural light: living room and master bedroom near south/east
         for rd in rooms_data:
@@ -279,14 +310,18 @@ def optimise_layout(
                     cost += 10.0 * (ratio - 0.08)
 
         # Kitchen-to-bedroom distance >= 3.0m
-        kitchen_centroids = [(rd["cx"], rd["cy"]) for rd in rooms_data
-                            if rd["type"] == RoomType.KITCHEN]
-        bedroom_centroids = [(rd["cx"], rd["cy"]) for rd in rooms_data
-                            if rd["type"] in (RoomType.BEDROOM, RoomType.MASTER_BEDROOM)]
+        kitchen_centroids = [
+            (rd["cx"], rd["cy"]) for rd in rooms_data if rd["type"] == RoomType.KITCHEN
+        ]
+        bedroom_centroids = [
+            (rd["cx"], rd["cy"])
+            for rd in rooms_data
+            if rd["type"] in (RoomType.BEDROOM, RoomType.MASTER_BEDROOM)
+        ]
 
         for kcx, kcy in kitchen_centroids:
             for bcx, bcy in bedroom_centroids:
-                dist = math.sqrt((kcx - bcx)**2 + (kcy - bcy)**2)
+                dist = math.sqrt((kcx - bcx) ** 2 + (kcy - bcy) ** 2)
                 if dist < 3.0:
                     cost += 5.0 * (3.0 - dist)
 
@@ -294,15 +329,22 @@ def optimise_layout(
         for i in range(n):
             for j in range(i + 1, n):
                 ri, rj = rooms_data[i], rooms_data[j]
-                ox = max(0, min(ri["x_max"], rj["x_max"]) - max(ri["x_min"], rj["x_min"]))
-                oy = max(0, min(ri["y_max"], rj["y_max"]) - max(ri["y_min"], rj["y_min"]))
+                ox = max(
+                    0, min(ri["x_max"], rj["x_max"]) - max(ri["x_min"], rj["x_min"])
+                )
+                oy = max(
+                    0, min(ri["y_max"], rj["y_max"]) - max(ri["y_min"], rj["y_min"])
+                )
                 cost += 20.0 * ox * oy
 
         return cost
 
     try:
         result = scipy_minimize(
-            objective, x0, method="L-BFGS-B", bounds=bounds,
+            objective,
+            x0,
+            method="L-BFGS-B",
+            bounds=bounds,
             options={"maxiter": 100, "maxfun": 500},
         )
         final = result.x
@@ -313,10 +355,10 @@ def optimise_layout(
     # Rebuild layout
     new_rooms = []
     for i, room in enumerate(layout.rooms):
-        x_min = max(0, final[4*i]) / plot_width
-        y_min = max(0, final[4*i+1]) / plot_height
-        x_max = min(plot_width, final[4*i+2]) / plot_width
-        y_max = min(plot_height, final[4*i+3]) / plot_height
+        x_min = max(0, final[4 * i]) / plot_width
+        y_min = max(0, final[4 * i + 1]) / plot_height
+        x_max = min(plot_width, final[4 * i + 2]) / plot_width
+        y_max = min(plot_height, final[4 * i + 3]) / plot_height
 
         # Ensure valid bbox
         if x_min >= x_max:
@@ -330,11 +372,13 @@ def optimise_layout(
             x_max=max(0.0, min(x_max, 1.0)),
             y_max=max(0.0, min(y_max, 1.0)),
         )
-        new_rooms.append(RoomLayout(
-            room_spec=room.room_spec,
-            bbox=bbox,
-            door_midpoints=room.door_midpoints,
-        ))
+        new_rooms.append(
+            RoomLayout(
+                room_spec=room.room_spec,
+                bbox=bbox,
+                door_midpoints=room.door_midpoints,
+            )
+        )
 
     return layout.model_copy(update={"rooms": new_rooms})
 
@@ -359,18 +403,18 @@ ROOM_PRIORITY = [
 
 # Ideal width:height aspect ratios for each room type
 ROOM_ASPECT_RATIO: dict[RoomType, float] = {
-    RoomType.LIVING_ROOM: 1.5,      # wide and rectangular
+    RoomType.LIVING_ROOM: 1.5,  # wide and rectangular
     RoomType.MASTER_BEDROOM: 1.25,  # slightly wider than tall
-    RoomType.BEDROOM: 1.2,          # slightly wider
-    RoomType.KITCHEN: 1.4,          # long and narrow
-    RoomType.BATHROOM: 0.65,        # taller than wide (narrow)
-    RoomType.TOILET: 0.6,           # narrow
-    RoomType.CORRIDOR: 4.0,         # very long and narrow
-    RoomType.BALCONY: 3.0,          # long strip
-    RoomType.STUDY: 1.1,            # nearly square
-    RoomType.DINING: 1.3,           # rectangular
-    RoomType.UTILITY: 0.8,          # small and squarish
-    RoomType.GARAGE: 1.8,           # wide
+    RoomType.BEDROOM: 1.2,  # slightly wider
+    RoomType.KITCHEN: 1.4,  # long and narrow
+    RoomType.BATHROOM: 0.65,  # taller than wide (narrow)
+    RoomType.TOILET: 0.6,  # narrow
+    RoomType.CORRIDOR: 4.0,  # very long and narrow
+    RoomType.BALCONY: 3.0,  # long strip
+    RoomType.STUDY: 1.1,  # nearly square
+    RoomType.DINING: 1.3,  # rectangular
+    RoomType.UTILITY: 0.8,  # small and squarish
+    RoomType.GARAGE: 1.8,  # wide
 }
 
 # Architectural zone definitions (normalised y-ranges)
@@ -426,15 +470,25 @@ def heuristic_place(
     for edge in layout.adjacency_edges:
         if edge.connection_type.value != "DOOR":
             continue
-        room_a = next((r for r in layout.rooms if r.room_spec.room_id == edge.room_a_id), None)
-        room_b = next((r for r in layout.rooms if r.room_spec.room_id == edge.room_b_id), None)
+        room_a = next(
+            (r for r in layout.rooms if r.room_spec.room_id == edge.room_a_id), None
+        )
+        room_b = next(
+            (r for r in layout.rooms if r.room_spec.room_id == edge.room_b_id), None
+        )
         if room_a is None or room_b is None:
             continue
 
         bed_room, bath_room = None, None
-        if room_a.room_spec.room_type in bedroom_types and room_b.room_spec.room_type in bathroom_types:
+        if (
+            room_a.room_spec.room_type in bedroom_types
+            and room_b.room_spec.room_type in bathroom_types
+        ):
             bed_room, bath_room = room_a, room_b
-        elif room_b.room_spec.room_type in bedroom_types and room_a.room_spec.room_type in bathroom_types:
+        elif (
+            room_b.room_spec.room_type in bedroom_types
+            and room_a.room_spec.room_type in bathroom_types
+        ):
             bed_room, bath_room = room_b, room_a
 
         if bed_room and bath_room and bath_room.room_spec.room_id not in ensuite_pairs:
@@ -454,17 +508,41 @@ def heuristic_place(
         facing = layout.facing.value
         # If house faces North (y=0 is North)
         if facing == "NORTH":
-            vastu_to_arch_zone = {"N": "front", "NE": "front", "NW": "front", 
-                                  "S": "rear", "SE": "rear", "SW": "rear"}
+            vastu_to_arch_zone = {
+                "N": "front",
+                "NE": "front",
+                "NW": "front",
+                "S": "rear",
+                "SE": "rear",
+                "SW": "rear",
+            }
         elif facing == "SOUTH":
-            vastu_to_arch_zone = {"S": "front", "SE": "front", "SW": "front", 
-                                  "N": "rear", "NE": "rear", "NW": "rear"}
+            vastu_to_arch_zone = {
+                "S": "front",
+                "SE": "front",
+                "SW": "front",
+                "N": "rear",
+                "NE": "rear",
+                "NW": "rear",
+            }
         elif facing == "EAST":
-            vastu_to_arch_zone = {"E": "front", "NE": "front", "SE": "front", 
-                                  "W": "rear", "NW": "rear", "SW": "rear"}
+            vastu_to_arch_zone = {
+                "E": "front",
+                "NE": "front",
+                "SE": "front",
+                "W": "rear",
+                "NW": "rear",
+                "SW": "rear",
+            }
         elif facing == "WEST":
-            vastu_to_arch_zone = {"W": "front", "NW": "front", "SW": "front", 
-                                  "E": "rear", "NE": "rear", "SE": "rear"}
+            vastu_to_arch_zone = {
+                "W": "front",
+                "NW": "front",
+                "SW": "front",
+                "E": "rear",
+                "NE": "rear",
+                "SE": "rear",
+            }
 
     for room in layout.rooms:
         if room.room_spec.room_id in ensuite_bath_ids:
@@ -473,12 +551,13 @@ def heuristic_place(
         if room.room_spec.room_type == RoomType.CORRIDOR:
             corridor_room = room
             continue
-            
+
         zone = ROOM_ZONE_PREFERENCE.get(room.room_spec.room_type, "rear")
-        
+
         # Override with Vastu preference if enabled
         if layout.vastu_enabled:
             from app.services.vastu_engine import _get_ideal_zone
+
             ideal_vastu = _get_ideal_zone(room.room_spec.room_type)
             # Pick first direction if multiple (e.g. "NW or SE" -> "NW")
             primary_vastu = ideal_vastu.split(" ")[0].strip()
@@ -501,7 +580,9 @@ def heuristic_place(
     # If still empty, fall back to simple treemap
     all_main = front_rooms + rear_rooms
     if not all_main:
-        all_main = [r for r in layout.rooms if r.room_spec.room_id not in ensuite_bath_ids]
+        all_main = [
+            r for r in layout.rooms if r.room_spec.room_id not in ensuite_bath_ids
+        ]
         if not all_main:
             all_main = list(layout.rooms)
         front_rooms = all_main
@@ -511,8 +592,16 @@ def heuristic_place(
     has_corridor = corridor_room is not None
     corridor_frac = 0.10 if has_corridor else 0.0  # 10% of plot for corridor strip
 
-    front_total_area = sum(max(r.room_spec.target_area_sqm, 1.0) for r in front_rooms) if front_rooms else 0.0
-    rear_total_area = sum(max(r.room_spec.target_area_sqm, 1.0) for r in rear_rooms) if rear_rooms else 0.0
+    front_total_area = (
+        sum(max(r.room_spec.target_area_sqm, 1.0) for r in front_rooms)
+        if front_rooms
+        else 0.0
+    )
+    rear_total_area = (
+        sum(max(r.room_spec.target_area_sqm, 1.0) for r in rear_rooms)
+        if rear_rooms
+        else 0.0
+    )
     all_area = front_total_area + rear_total_area
 
     if all_area > 0:
@@ -544,7 +633,9 @@ def heuristic_place(
     if front_rooms:
         front_rooms.sort(key=lambda r: -r.room_spec.target_area_sqm)
         f_total = sum(max(r.room_spec.target_area_sqm, 1.0) for r in front_rooms)
-        f_weights = [max(r.room_spec.target_area_sqm, 1.0) / f_total for r in front_rooms]
+        f_weights = [
+            max(r.room_spec.target_area_sqm, 1.0) / f_total for r in front_rooms
+        ]
         f_bboxes = _treemap_subdivide(f_weights, 0.0, front_y0, 1.0, front_y1)
         for i, room in enumerate(front_rooms):
             x0, y0_, x1, y1_ = f_bboxes[i]
@@ -554,21 +645,27 @@ def heuristic_place(
                 x0, y0_, x1, y1_, room.room_spec.room_type, plot_width, plot_height
             )
             bbox = BoundingBox(x_min=x0, y_min=y0_, x_max=x1, y_max=y1_)
-            placed.append(RoomLayout(room_spec=room.room_spec, bbox=bbox, door_midpoints=[]))
+            placed.append(
+                RoomLayout(room_spec=room.room_spec, bbox=bbox, door_midpoints=[])
+            )
 
     # ── Step 3b: Place corridor as connecting strip ──
     if corridor_room:
-        placed.append(RoomLayout(
-            room_spec=corridor_room.room_spec,
-            bbox=BoundingBox(x_min=0.0, y_min=corr_y0, x_max=1.0, y_max=corr_y1),
-            door_midpoints=[],
-        ))
+        placed.append(
+            RoomLayout(
+                room_spec=corridor_room.room_spec,
+                bbox=BoundingBox(x_min=0.0, y_min=corr_y0, x_max=1.0, y_max=corr_y1),
+                door_midpoints=[],
+            )
+        )
 
     # ── Step 4: Place rear-zone rooms ──
     if rear_rooms:
         rear_rooms.sort(key=lambda r: -r.room_spec.target_area_sqm)
         r_total = sum(max(r.room_spec.target_area_sqm, 1.0) for r in rear_rooms)
-        r_weights = [max(r.room_spec.target_area_sqm, 1.0) / r_total for r in rear_rooms]
+        r_weights = [
+            max(r.room_spec.target_area_sqm, 1.0) / r_total for r in rear_rooms
+        ]
         r_bboxes = _treemap_subdivide(r_weights, 0.0, rear_y0, 1.0, rear_y1)
         for i, room in enumerate(rear_rooms):
             x0, y0_, x1, y1_ = r_bboxes[i]
@@ -577,7 +674,9 @@ def heuristic_place(
                 x0, y0_, x1, y1_, room.room_spec.room_type, plot_width, plot_height
             )
             bbox = BoundingBox(x_min=x0, y_min=y0_, x_max=x1, y_max=y1_)
-            placed.append(RoomLayout(room_spec=room.room_spec, bbox=bbox, door_midpoints=[]))
+            placed.append(
+                RoomLayout(room_spec=room.room_spec, bbox=bbox, door_midpoints=[])
+            )
 
     # Improve adjacency via swapping
     placed = _improve_adjacency_by_swapping(
@@ -588,18 +687,27 @@ def heuristic_place(
     placed = _nest_ensuite_bathrooms(placed, ensuite_rooms, ensuite_pairs)
 
     # ── Step 6: Generate door midpoints ──
-    placed = _generate_door_midpoints(placed, layout.adjacency_edges, plot_width, plot_height)
+    placed = _generate_door_midpoints(
+        placed, layout.adjacency_edges, plot_width, plot_height
+    )
 
-    result = layout.model_copy(update={
-        "rooms": placed,
-        "generation_mode": "heuristic",
-    })
-    logger.info(f"Heuristic placer: placed {len(placed)} rooms (incl. {len(ensuite_rooms)} en-suites)")
+    result = layout.model_copy(
+        update={
+            "rooms": placed,
+            "generation_mode": "heuristic",
+        }
+    )
+    logger.info(
+        f"Heuristic placer: placed {len(placed)} rooms (incl. {len(ensuite_rooms)} en-suites)"
+    )
     return result
 
 
 def _clamp_bbox(
-    x0: float, y0: float, x1: float, y1: float,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
 ) -> tuple[float, float, float, float]:
     """Clamp bbox to [0,1] and ensure minimum size."""
     x0 = max(0.0, min(x0, 1.0))
@@ -614,7 +722,10 @@ def _clamp_bbox(
 
 
 def _adjust_aspect_ratio(
-    x0: float, y0: float, x1: float, y1: float,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
     room_type: RoomType,
     plot_width: float,
     plot_height: float,
@@ -669,11 +780,13 @@ def _nest_ensuite_bathrooms(
         bed_id = ensuite_pairs.get(bath_id)
         if not bed_id or bed_id not in placed_map:
             # Fallback: put bathroom in a small corner of the plot
-            result.append(RoomLayout(
-                room_spec=bath_room.room_spec,
-                bbox=BoundingBox(x_min=0.85, y_min=0.85, x_max=1.0, y_max=1.0),
-                door_midpoints=[],
-            ))
+            result.append(
+                RoomLayout(
+                    room_spec=bath_room.room_spec,
+                    bbox=BoundingBox(x_min=0.85, y_min=0.85, x_max=1.0, y_max=1.0),
+                    door_midpoints=[],
+                )
+            )
             continue
 
         bed = placed_map[bed_id]
@@ -734,11 +847,13 @@ def _nest_ensuite_bathrooms(
         placed_map[bed_id] = updated_bed
 
         # Add the bathroom
-        result.append(RoomLayout(
-            room_spec=bath_room.room_spec,
-            bbox=bath_bbox,
-            door_midpoints=[],
-        ))
+        result.append(
+            RoomLayout(
+                room_spec=bath_room.room_spec,
+                bbox=bath_bbox,
+                door_midpoints=[],
+            )
+        )
 
     return result
 
@@ -777,11 +892,15 @@ def _place_corridor(
 
     for i, room in enumerate(placed):
         if i == corridor_idx:
-            result.append(RoomLayout(
-                room_spec=room.room_spec,
-                bbox=BoundingBox(x_min=0.0, y_min=corr_y_min, x_max=1.0, y_max=corr_y_max),
-                door_midpoints=[],
-            ))
+            result.append(
+                RoomLayout(
+                    room_spec=room.room_spec,
+                    bbox=BoundingBox(
+                        x_min=0.0, y_min=corr_y_min, x_max=1.0, y_max=corr_y_max
+                    ),
+                    door_midpoints=[],
+                )
+            )
             continue
 
         bx = room.bbox
@@ -805,11 +924,13 @@ def _place_corridor(
                     x_max=bx.x_max,
                     y_max=bx.y_max,
                 )
-            result.append(RoomLayout(
-                room_spec=room.room_spec,
-                bbox=new_bbox,
-                door_midpoints=[],
-            ))
+            result.append(
+                RoomLayout(
+                    room_spec=room.room_spec,
+                    bbox=new_bbox,
+                    door_midpoints=[],
+                )
+            )
         else:
             result.append(room)
 
@@ -826,9 +947,20 @@ def _generate_door_midpoints(
 
     For each DOOR or OPENING edge, find the shared wall and place the door
     at the midpoint of the overlapping segment.
+
+    Also ensures bedrooms (without en-suite) have doors to corridor/living room.
     """
     room_map = {r.room_spec.room_id: r for r in placed}
-    door_map: dict[str, list[tuple[float, float]]] = {r.room_spec.room_id: [] for r in placed}
+    door_map: dict[str, list[tuple[float, float]]] = {
+        r.room_spec.room_id: [] for r in placed
+    }
+
+    bedroom_types = {RoomType.BEDROOM, RoomType.MASTER_BEDROOM}
+    bathroom_types = {RoomType.BATHROOM, RoomType.TOILET}
+
+    ensuite_bath_ids: set[str] = _identify_ensuite_baths(
+        edges, room_map, bedroom_types, bathroom_types
+    )
 
     for edge in edges:
         if edge.connection_type.value == "WALL":
@@ -841,56 +973,119 @@ def _generate_door_midpoints(
 
         ba, bb = ra.bbox, rb.bbox
 
-        door_x, door_y = None, None
+        door_pos = _find_door_position(ba, bb)
+        if door_pos:
+            door_map[edge.room_a_id].append(door_pos)
+            door_map[edge.room_b_id].append(door_pos)
 
-        # Check vertical adjacency (rooms share a vertical wall)
-        if abs(ba.x_max - bb.x_min) < 0.015:
-            # A is left of B
-            y_overlap_min = max(ba.y_min, bb.y_min)
-            y_overlap_max = min(ba.y_max, bb.y_max)
-            if y_overlap_max - y_overlap_min > 0.02:
-                door_x = ba.x_max
-                door_y = (y_overlap_min + y_overlap_max) / 2
-        elif abs(bb.x_max - ba.x_min) < 0.015:
-            # B is left of A
-            y_overlap_min = max(ba.y_min, bb.y_min)
-            y_overlap_max = min(ba.y_max, bb.y_max)
-            if y_overlap_max - y_overlap_min > 0.02:
-                door_x = bb.x_max
-                door_y = (y_overlap_min + y_overlap_max) / 2
-
-        # Check horizontal adjacency (rooms share a horizontal wall)
-        if door_x is None:
-            if abs(ba.y_max - bb.y_min) < 0.015:
-                # A is above B
-                x_overlap_min = max(ba.x_min, bb.x_min)
-                x_overlap_max = min(ba.x_max, bb.x_max)
-                if x_overlap_max - x_overlap_min > 0.02:
-                    door_x = (x_overlap_min + x_overlap_max) / 2
-                    door_y = ba.y_max
-            elif abs(bb.y_max - ba.y_min) < 0.015:
-                # B is above A
-                x_overlap_min = max(ba.x_min, bb.x_min)
-                x_overlap_max = min(ba.x_max, bb.x_max)
-                if x_overlap_max - x_overlap_min > 0.02:
-                    door_x = (x_overlap_min + x_overlap_max) / 2
-                    door_y = bb.y_max
-
-        if door_x is not None and door_y is not None:
-            door_map[edge.room_a_id].append((door_x, door_y))
-            door_map[edge.room_b_id].append((door_x, door_y))
+    _ensure_bedroom_access(placed, door_map, bedroom_types, ensuite_bath_ids)
 
     # Rebuild rooms with door midpoints
     result = []
     for room in placed:
         doors = door_map.get(room.room_spec.room_id, [])
-        result.append(RoomLayout(
-            room_spec=room.room_spec,
-            bbox=room.bbox,
-            door_midpoints=doors,
-        ))
+        result.append(
+            RoomLayout(
+                room_spec=room.room_spec,
+                bbox=room.bbox,
+                door_midpoints=doors,
+            )
+        )
 
     return result
+
+
+def _identify_ensuite_baths(
+    edges: list[AdjacencyEdge],
+    room_map: dict[str, RoomLayout],
+    bedroom_types: set[RoomType],
+    bathroom_types: set[RoomType],
+) -> set[str]:
+    """Identify bathrooms that are en-suite to bedrooms."""
+    ensuite_bath_ids: set[str] = set()
+    for edge in edges:
+        if edge.connection_type.value != "DOOR":
+            continue
+        ra = room_map.get(edge.room_a_id)
+        rb = room_map.get(edge.room_b_id)
+        if ra is None or rb is None:
+            continue
+        if (
+            ra.room_spec.room_type in bedroom_types
+            and rb.room_spec.room_type in bathroom_types
+        ):
+            ensuite_bath_ids.add(rb.room_spec.room_id)
+        elif (
+            rb.room_spec.room_type in bedroom_types
+            and ra.room_spec.room_type in bathroom_types
+        ):
+            ensuite_bath_ids.add(ra.room_spec.room_id)
+    return ensuite_bath_ids
+
+
+def _find_door_position(ba: BoundingBox, bb: BoundingBox) -> tuple[float, float] | None:
+    """Find door position on shared wall between two rooms."""
+    door_x, door_y = None, None
+
+    if abs(ba.x_max - bb.x_min) < DOOR_TOLERANCE:
+        y_overlap_min = max(ba.y_min, bb.y_min)
+        y_overlap_max = min(ba.y_max, bb.y_max)
+        if y_overlap_max - y_overlap_min > MIN_OVERLAP_FOR_DOOR:
+            door_x = ba.x_max
+            door_y = (y_overlap_min + y_overlap_max) / 2
+    elif abs(bb.x_max - ba.x_min) < DOOR_TOLERANCE:
+        y_overlap_min = max(ba.y_min, bb.y_min)
+        y_overlap_max = min(ba.y_max, bb.y_max)
+        if y_overlap_max - y_overlap_min > MIN_OVERLAP_FOR_DOOR:
+            door_x = bb.x_max
+            door_y = (y_overlap_min + y_overlap_max) / 2
+
+    if door_x is None:
+        if abs(ba.y_max - bb.y_min) < DOOR_TOLERANCE:
+            x_overlap_min = max(ba.x_min, bb.x_min)
+            x_overlap_max = min(ba.x_max, bb.x_max)
+            if x_overlap_max - x_overlap_min > MIN_OVERLAP_FOR_DOOR:
+                door_x = (x_overlap_min + x_overlap_max) / 2
+                door_y = ba.y_max
+        elif abs(bb.y_max - ba.y_min) < DOOR_TOLERANCE:
+            x_overlap_min = max(ba.x_min, bb.x_min)
+            x_overlap_max = min(ba.x_max, bb.x_max)
+            if x_overlap_max - x_overlap_min > MIN_OVERLAP_FOR_DOOR:
+                door_x = (x_overlap_min + x_overlap_max) / 2
+                door_y = bb.y_max
+
+    return (door_x, door_y) if door_x is not None else None
+
+
+def _ensure_bedroom_access(
+    placed: list[RoomLayout],
+    door_map: dict[str, list[tuple[float, float]]],
+    bedroom_types: set[RoomType],
+    ensuite_bath_ids: set[str],
+) -> None:
+    """Ensure bedrooms without en-suite have access doors to corridor/living room."""
+    corridor_room = next(
+        (r for r in placed if r.room_spec.room_type == RoomType.CORRIDOR), None
+    )
+    living_room = next(
+        (r for r in placed if r.room_spec.room_type == RoomType.LIVING_ROOM), None
+    )
+    access_room = corridor_room or living_room
+    if not access_room:
+        return
+
+    for room in placed:
+        if room.room_spec.room_type not in bedroom_types:
+            continue
+        if room.room_spec.room_id in ensuite_bath_ids:
+            continue
+        if door_map.get(room.room_spec.room_id):
+            continue
+
+        door_pos = _find_door_position(room.bbox, access_room.bbox)
+        if door_pos:
+            door_map[room.room_spec.room_id].append(door_pos)
+            door_map[access_room.room_spec.room_id].append(door_pos)
 
 
 def _improve_adjacency_by_swapping(
@@ -931,11 +1126,17 @@ def _improve_adjacency_by_swapping(
             shared_wall = 0.0
             # Touching on x-axis.
             if abs(ba.x_max - bb.x_min) < 0.01 or abs(bb.x_max - ba.x_min) < 0.01:
-                y_overlap = max(0, min(ba.y_max, bb.y_max) - max(ba.y_min, bb.y_min)) * plot_height
+                y_overlap = (
+                    max(0, min(ba.y_max, bb.y_max) - max(ba.y_min, bb.y_min))
+                    * plot_height
+                )
                 shared_wall = max(shared_wall, y_overlap)
             # Touching on y-axis.
             if abs(ba.y_max - bb.y_min) < 0.01 or abs(bb.y_max - ba.y_min) < 0.01:
-                x_overlap = max(0, min(ba.x_max, bb.x_max) - max(ba.x_min, bb.x_min)) * plot_width
+                x_overlap = (
+                    max(0, min(ba.x_max, bb.x_max) - max(ba.x_min, bb.x_min))
+                    * plot_width
+                )
                 shared_wall = max(shared_wall, x_overlap)
             if shared_wall >= 0.9:
                 satisfied += 1
@@ -977,7 +1178,10 @@ def _improve_adjacency_by_swapping(
 
 def _treemap_subdivide(
     weights: list[float],
-    x0: float, y0: float, x1: float, y1: float,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
 ) -> list[tuple[float, float, float, float]]:
     """Recursively subdivide a rectangle into slices proportional to weights.
 
@@ -1076,10 +1280,14 @@ def run_constraint_pipeline(
         # it would move rooms apart and create gaps.
 
     # Calculate metrics
-    result = result.model_copy(update={
-        "overlap_rate": _compute_overlap(result, plot_width, plot_height),
-        "adjacency_satisfaction": _compute_adjacency(result, plot_width, plot_height),
-    })
+    result = result.model_copy(
+        update={
+            "overlap_rate": _compute_overlap(result, plot_width, plot_height),
+            "adjacency_satisfaction": _compute_adjacency(
+                result, plot_width, plot_height
+            ),
+        }
+    )
 
     logger.info(
         f"Constraint pipeline complete: "

@@ -152,20 +152,26 @@ INDIAN TERMINOLOGY MAPPINGS:
 
 ARCHITECTURAL RULES (MUST FOLLOW):
 - Every BEDROOM and MASTER_BEDROOM MUST have its own attached BATHROOM connected via a DOOR adjacency.
-- For 2+ bedroom layouts, always include exactly one CORRIDOR room (4-6 sqm) that acts as a hallway.
-- The CORRIDOR connects to all major rooms (LIVING_ROOM, KITCHEN, each BEDROOM/MASTER_BEDROOM) via DOOR adjacencies.
-- Bathrooms are accessed ONLY through their parent bedroom (DOOR), NOT through the corridor.
-- LIVING_ROOM connects to KITCHEN via OPENING.
+- For 2+ bedroom layouts, always include exactly one CORRIDOR room (4-6 sqm) that acts as a central circulation spine.
+- The CORRIDOR connects to all major private rooms (each BEDROOM/MASTER_BEDROOM) via DOOR adjacencies.
+- Bathrooms are accessed ONLY through their parent bedroom (DOOR), never directly from the Living Room or Kitchen.
+- LIVING_ROOM connects to KITCHEN via OPENING, promoting an open-plan living layout.
 - KITCHEN connects to DINING (if present) via OPENING.
+- Ensure logical flow: Entrance -> Living Room -> Dining/Kitchen -> Corridor -> Bedrooms.
 
 10. EN-SUITE BATHROOMS: If a prompt says "bedroom with attached bathroom", you MUST add a DOOR connection between that specific BEDROOM and that specific BATHROOM. Double check this in your `verification_` step.
-11. CONNECTIVITY: Never leave a room floating. Ensure every room is connected to a Hallway/Corridor or Living Room.
-12. THINKING STEP: Use the `thinking_` and `verification_` fields to write out your logic before outputting the structural arrays. This improves your accuracy.
+11. VASTU COMPLIANCE: If Vastu is enabled or requested, use these zones (based on plot facing):
+    - MASTER_BEDROOM must be in the South-West (SW).
+    - KITCHEN must be in the South-East (SE) or North-West (NW).
+    - STUDY (Pooja/Prayer room) must be in the North-East (NE).
+    - LIVING_ROOM is ideal in North, East, or North-East.
+12. CONNECTIVITY: Never leave a room floating. Ensure every room is connected to a Hallway/Corridor or Living Room.
+13. THINKING STEP: Use the `thinking_` and `verification_` fields to write out your logic before outputting the structural arrays. This improves your accuracy.
 
-DEFAULTS:
-- If no plot area mentioned, use 100.0 sqm
+DEFAULTS (Real-world architectural standards):
+- If no plot area mentioned, use 120.0 sqm
 - If no facing mentioned, use NORTH
-- Assign reasonable areas: LIVING_ROOM=20-30, BEDROOM=12-18, MASTER_BEDROOM=16-24, KITCHEN=8-14, BATHROOM=4-6 (en-suite), BALCONY=4-8, CORRIDOR=4-6
+- Assign realistic standard areas: LIVING_ROOM=20-35, BEDROOM=12-15, MASTER_BEDROOM=16-24, KITCHEN=12-16, BATHROOM=4.5-6.0 (en-suite), BALCONY=4-8, CORRIDOR=4-8
 - Generate unique room_id values like "room_1", "room_2", etc.
 """
 
