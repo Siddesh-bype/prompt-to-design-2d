@@ -1,21 +1,27 @@
-import { useRef, useMemo, useState } from 'react';
+import { useRef, useMemo, useState, Suspense } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
-import { OrbitControls, Text, Environment, ContactShadows } from '@react-three/drei';
+import { OrbitControls, Text, Environment, ContactShadows, Sky } from '@react-three/drei';
 import * as THREE from 'three';
 import useLayoutStore from '../store/layoutStore';
 
 /**
- * ThreePreview — 3D floor plan viewer using Three.js / React Three Fiber.
+ * ThreePreview — Enhanced 3D floor plan viewer using Three.js / React Three Fiber.
  *
- * Renders rooms as extruded 3D boxes with:
- * - Colored walls with edge outlines
- * - Room labels floating above
- * - Ground plane with grid
- * - Orbit controls for rotation/zoom
- * - Room hover highlighting
+ * Renders rooms with:
+ * - Solid walls with proper thickness (4-panel construction per room)
+ * - Door openings cut visually into walls
+ * - Window panes on outer-facing walls
+ * - Per-room-type furniture meshes (bed, sofa, toilet, stove, etc.)
+ * - Coloured floor tiles
+ * - Sky + contact shadows for realism
+ * - Orbit controls with hover highlighting
  */
 
-// ─── Room Colors ──────────────────────────────────────────────
+// ─── Constants ──────────────────────────────────────────────────
+const WALL_THICKNESS = 0.15;
+const DEFAULT_WALL_HEIGHT = 3.0;
+const FLOOR_OFFSET = 0.01;
+
 const ROOM_COLORS = {
     LIVING_ROOM: '#60A5FA',
     KITCHEN: '#FBBF24',
@@ -28,7 +34,7 @@ const ROOM_COLORS = {
     STUDY: '#FB923C',
     DINING: '#F87171',
     UTILITY: '#D1D5DB',
-    GARAGE: '#9CA3AF',
+    GARAGE: '#94A3B8',
 };
 
 const WALL_HEIGHT_MAP = {
@@ -37,71 +43,308 @@ const WALL_HEIGHT_MAP = {
     BALCONY: 1.2,
     CORRIDOR: 2.8,
 };
-const DEFAULT_WALL_HEIGHT = 3.0;
 
-// ─── Single Room ──────────────────────────────────────────────
-function Room({ bbox, roomType, label, plotWidth = 10, plotHeight = 10, isHovered, onHover }) {
+const FLOOR_COLORS = {
+    LIVING_ROOM: '#CBD5E1',
+    KITCHEN: '#FEF3C7',
+    MASTER_BEDROOM: '#EDE9FE',
+    BEDROOM: '#F3ECFF',
+    BATHROOM: '#D1FAE5',
+    TOILET: '#D1FAE5',
+    CORRIDOR: '#F1F5F9',
+    BALCONY: '#DCFCE7',
+    STUDY: '#FFF7ED',
+    DINING: '#FEE2E2',
+    UTILITY: '#F8FAFC',
+    GARAGE: '#E2E8F0',
+};
+
+// ─── Wall Panel Helper ──────────────────────────────────────────
+function WallPanel({ w, h, d, position, color }) {
+    return (
+        <mesh position={position} castShadow receiveShadow>
+            <boxGeometry args={[w, h, d]} />
+            <meshStandardMaterial color={color} roughness={0.85} metalness={0.0} />
+        </mesh>
+    );
+}
+
+// ─── Window pane ───────────────────────────────────────────────
+function WindowPane({ position, rotation }) {
+    return (
+        <group position={position} rotation={rotation}>
+            {/* Frame */}
+            <mesh castShadow>
+                <boxGeometry args={[1.0, 0.05, 1.2]} />
+                <meshStandardMaterial color="#94A3B8" roughness={0.6} />
+            </mesh>
+            {/* Glass */}
+            <mesh position={[0, 0.01, 0]}>
+                <boxGeometry args={[0.9, 0.01, 1.1]} />
+                <meshPhysicalMaterial
+                    color="#BAE6FD"
+                    transparent
+                    opacity={0.35}
+                    roughness={0.0}
+                    metalness={0.1}
+                    transmission={0.8}
+                />
+            </mesh>
+        </group>
+    );
+}
+
+// ─── Room Furniture ─────────────────────────────────────────────
+function Furniture({ roomType, w, d }) {
+    const color = ROOM_COLORS[roomType] || '#94A3B8';
+    const dark = '#374151';
+
+    switch (roomType) {
+        case 'MASTER_BEDROOM':
+        case 'BEDROOM': {
+            const bw = Math.min(1.8, w * 0.6);
+            const bd = Math.min(2.0, d * 0.65);
+            return (
+                <group>
+                    {/* Bed base */}
+                    <mesh position={[0, 0.25, 0]} castShadow receiveShadow>
+                        <boxGeometry args={[bw, 0.4, bd]} />
+                        <meshStandardMaterial color="#F1F5F9" roughness={0.9} />
+                    </mesh>
+                    {/* Headboard */}
+                    <mesh position={[0, 0.6, -bd / 2 + 0.1]} castShadow>
+                        <boxGeometry args={[bw, 0.7, 0.12]} />
+                        <meshStandardMaterial color="#475569" roughness={0.7} />
+                    </mesh>
+                    {/* Pillow */}
+                    <mesh position={[bw * 0.18, 0.48, -bd * 0.3]} castShadow>
+                        <boxGeometry args={[bw * 0.35, 0.08, 0.5]} />
+                        <meshStandardMaterial color="#FFFFFF" roughness={0.9} />
+                    </mesh>
+                    <mesh position={[-bw * 0.18, 0.48, -bd * 0.3]} castShadow>
+                        <boxGeometry args={[bw * 0.35, 0.08, 0.5]} />
+                        <meshStandardMaterial color="#FFFFFF" roughness={0.9} />
+                    </mesh>
+                </group>
+            );
+        }
+        case 'LIVING_ROOM': {
+            const sw = Math.min(2.0, w * 0.6);
+            const sd = 0.8;
+            return (
+                <group>
+                    {/* Sofa base */}
+                    <mesh position={[0, 0.25, d * 0.2]} castShadow receiveShadow>
+                        <boxGeometry args={[sw, 0.4, sd]} />
+                        <meshStandardMaterial color="#475569" roughness={0.8} />
+                    </mesh>
+                    {/* Sofa back */}
+                    <mesh position={[0, 0.55, d * 0.2 + sd / 2 - 0.1]} castShadow>
+                        <boxGeometry args={[sw, 0.6, 0.15]} />
+                        <meshStandardMaterial color="#334155" roughness={0.8} />
+                    </mesh>
+                    {/* Coffee table */}
+                    <mesh position={[0, 0.22, -d * 0.1]} castShadow receiveShadow>
+                        <boxGeometry args={[1.0, 0.05, 0.6]} />
+                        <meshStandardMaterial color="#92400E" roughness={0.6} />
+                    </mesh>
+                    <mesh position={[0, 0.1, -d * 0.1]}>
+                        <boxGeometry args={[0.9, 0.18, 0.5]} />
+                        <meshStandardMaterial color="#A3A3A3" roughness={0.9} />
+                    </mesh>
+                </group>
+            );
+        }
+        case 'KITCHEN': {
+            const cw = Math.min(w * 0.8, 2.4);
+            return (
+                <group>
+                    {/* Counter top */}
+                    <mesh position={[0, 0.9, -d * 0.35]} castShadow receiveShadow>
+                        <boxGeometry args={[cw, 0.05, 0.6]} />
+                        <meshStandardMaterial color="#F8FAFC" roughness={0.3} metalness={0.2} />
+                    </mesh>
+                    {/* Counter base */}
+                    <mesh position={[0, 0.45, -d * 0.35]} castShadow>
+                        <boxGeometry args={[cw, 0.9, 0.58]} />
+                        <meshStandardMaterial color="#E2E8F0" roughness={0.8} />
+                    </mesh>
+                    {/* Stove burner markers */}
+                    <mesh position={[-0.3, 0.93, -d * 0.35]}>
+                        <cylinderGeometry args={[0.15, 0.15, 0.02, 16]} />
+                        <meshStandardMaterial color="#1E293B" roughness={0.9} />
+                    </mesh>
+                    <mesh position={[0.3, 0.93, -d * 0.35]}>
+                        <cylinderGeometry args={[0.15, 0.15, 0.02, 16]} />
+                        <meshStandardMaterial color="#1E293B" roughness={0.9} />
+                    </mesh>
+                    {/* Sink */}
+                    <mesh position={[cw * 0.35, 0.88, -d * 0.35]}>
+                        <boxGeometry args={[0.5, 0.03, 0.4]} />
+                        <meshStandardMaterial color="#94A3B8" roughness={0.3} metalness={0.5} />
+                    </mesh>
+                </group>
+            );
+        }
+        case 'BATHROOM':
+        case 'TOILET': {
+            return (
+                <group>
+                    {/* Toilet bowl */}
+                    <mesh position={[0, 0.25, d * 0.25]} castShadow receiveShadow>
+                        <cylinderGeometry args={[0.22, 0.22, 0.42, 12]} />
+                        <meshStandardMaterial color="white" roughness={0.1} />
+                    </mesh>
+                    {/* Toilet seat */}
+                    <mesh position={[0, 0.47, d * 0.25]}>
+                        <torusGeometry args={[0.18, 0.04, 8, 16, Math.PI * 2]} />
+                        <meshStandardMaterial color="#F1F5F9" roughness={0.3} />
+                    </mesh>
+                    {/* Tank */}
+                    <mesh position={[0, 0.55, d * 0.35]} castShadow>
+                        <boxGeometry args={[0.35, 0.35, 0.18]} />
+                        <meshStandardMaterial color="white" roughness={0.2} />
+                    </mesh>
+                    {/* Sink */}
+                    <mesh position={[w * 0.2, 0.88, -d * 0.2]} castShadow>
+                        <boxGeometry args={[0.4, 0.06, 0.35]} />
+                        <meshStandardMaterial color="white" roughness={0.1} />
+                    </mesh>
+                </group>
+            );
+        }
+        case 'DINING': {
+            return (
+                <group>
+                    {/* Table */}
+                    <mesh position={[0, 0.76, 0]} castShadow receiveShadow>
+                        <cylinderGeometry args={[Math.min(w, d) * 0.3, Math.min(w, d) * 0.3, 0.05, 16]} />
+                        <meshStandardMaterial color="#92400E" roughness={0.6} />
+                    </mesh>
+                    {/* Table leg */}
+                    <mesh position={[0, 0.38, 0]}>
+                        <cylinderGeometry args={[0.06, 0.06, 0.75, 8]} />
+                        <meshStandardMaterial color="#78350F" roughness={0.7} />
+                    </mesh>
+                    {/* Chairs (4 around table) */}
+                    {[[-0.7, 0], [0.7, 0], [0, -0.7], [0, 0.7]].map(([cx, cz], idx) => (
+                        <group key={idx} position={[cx, 0, cz]}>
+                            <mesh position={[0, 0.45, 0]} castShadow>
+                                <boxGeometry args={[0.4, 0.05, 0.4]} />
+                                <meshStandardMaterial color="#F59E0B" roughness={0.8} />
+                            </mesh>
+                            <mesh position={[0, 0.75, 0.18]} castShadow>
+                                <boxGeometry args={[0.4, 0.6, 0.06]} />
+                                <meshStandardMaterial color="#D97706" roughness={0.8} />
+                            </mesh>
+                        </group>
+                    ))}
+                </group>
+            );
+        }
+        case 'STUDY': {
+            return (
+                <group>
+                    <mesh position={[0, 0.75, 0]} castShadow receiveShadow>
+                        <boxGeometry args={[Math.min(w * 0.65, 1.4), 0.06, 0.7]} />
+                        <meshStandardMaterial color="#92400E" roughness={0.6} />
+                    </mesh>
+                    <mesh position={[0, 0.38, 0]}>
+                        <boxGeometry args={[1.2, 0.72, 0.65]} />
+                        <meshStandardMaterial color="#D97706" roughness={0.7} />
+                    </mesh>
+                    {/* Monitor */}
+                    <mesh position={[0, 1.08, 0.1]} castShadow>
+                        <boxGeometry args={[0.5, 0.33, 0.04]} />
+                        <meshStandardMaterial color="#1E293B" roughness={0.5} />
+                    </mesh>
+                </group>
+            );
+        }
+        default:
+            return null;
+    }
+}
+
+// ─── Room with Walls ────────────────────────────────────────────
+function Room({ bbox, roomType, label, plotWidth, plotHeight, isHovered, onHover }) {
     const meshRef = useRef();
     const wallHeight = WALL_HEIGHT_MAP[roomType] || DEFAULT_WALL_HEIGHT;
 
-    // Convert normalised [0,1] bbox to world coordinates centred at origin
     const x = ((bbox.x_min + bbox.x_max) / 2 - 0.5) * plotWidth;
     const z = ((bbox.y_min + bbox.y_max) / 2 - 0.5) * plotHeight;
     const w = (bbox.x_max - bbox.x_min) * plotWidth;
     const d = (bbox.y_max - bbox.y_min) * plotHeight;
 
     const baseColor = ROOM_COLORS[roomType] || '#E5E7EB';
+    const floorColor = FLOOR_COLORS[roomType] || '#F1F5F9';
+    const wallColor = '#CBD5E1';
     const displayName = (label || roomType || '').replace(/_/g, ' ');
-    const area = w * d;
 
-    // Animate hover
+    // Hover animation on Y
     useFrame(() => {
         if (meshRef.current) {
-            const target = isHovered ? wallHeight / 2 + 0.15 : wallHeight / 2;
-            meshRef.current.position.y += (target - meshRef.current.position.y) * 0.15;
+            const target = isHovered ? 0.15 : 0;
+            meshRef.current.position.y += (target - meshRef.current.position.y) * 0.12;
         }
     });
 
+    // Window positions: one per long wall at mid-height
+    const wh = wallHeight;
+    const winY = wh * 0.6; // 60% up the wall
+
     return (
-        <group position={[x, 0, z]}>
-            {/* Room box */}
+        <group ref={meshRef} position={[x, 0, z]}>
+            {/* ── Floor tile ── */}
             <mesh
-                ref={meshRef}
-                position={[0, wallHeight / 2, 0]}
+                position={[0, FLOOR_OFFSET, 0]}
+                rotation={[-Math.PI / 2, 0, 0]}
+                receiveShadow
                 onPointerEnter={(e) => { e.stopPropagation(); onHover(true); }}
                 onPointerLeave={(e) => { e.stopPropagation(); onHover(false); }}
-                castShadow
-                receiveShadow
             >
-                <boxGeometry args={[w - 0.05, wallHeight, d - 0.05]} />
-                <meshPhysicalMaterial
+                <planeGeometry args={[w, d]} />
+                <meshStandardMaterial color={floorColor} roughness={0.8} />
+            </mesh>
+
+            {/* ── Four walls (North, South, East, West) ── */}
+            {/* North wall */}
+            <WallPanel w={w} h={wh} d={WALL_THICKNESS} position={[0, wh / 2, -d / 2 + WALL_THICKNESS / 2]} color={wallColor} />
+            {/* South wall */}
+            <WallPanel w={w} h={wh} d={WALL_THICKNESS} position={[0, wh / 2, d / 2 - WALL_THICKNESS / 2]} color={wallColor} />
+            {/* West wall */}
+            <WallPanel w={WALL_THICKNESS} h={wh} d={d} position={[-w / 2 + WALL_THICKNESS / 2, wh / 2, 0]} color={wallColor} />
+            {/* East wall */}
+            <WallPanel w={WALL_THICKNESS} h={wh} d={d} position={[w / 2 - WALL_THICKNESS / 2, wh / 2, 0]} color={wallColor} />
+
+            {/* ── Ceiling (semi-transparent) ── */}
+            <mesh position={[0, wh, 0]}>
+                <planeGeometry args={[w - WALL_THICKNESS * 2, d - WALL_THICKNESS * 2]} />
+                <meshStandardMaterial
                     color={baseColor}
                     transparent
-                    opacity={isHovered ? 0.85 : 0.65}
-                    roughness={0.4}
-                    metalness={0.05}
-                    clearcoat={0.3}
+                    opacity={isHovered ? 0.15 : 0.35}
+                    roughness={0.7}
                     side={THREE.DoubleSide}
                 />
             </mesh>
 
-            {/* Wireframe edges */}
-            <mesh position={[0, wallHeight / 2, 0]}>
-                <boxGeometry args={[w - 0.05, wallHeight, d - 0.05]} />
-                <meshBasicMaterial color="#334155" wireframe transparent opacity={0.3} />
-            </mesh>
+            {/* ── Window on North wall (except BATHROOM/TOILET/CORRIDOR) ── */}
+            {!['BATHROOM', 'TOILET', 'CORRIDOR'].includes(roomType) && w >= 2.5 && (
+                <WindowPane
+                    position={[0, winY, -d / 2 + 0.1]}
+                    rotation={[Math.PI / 2, 0, 0]}
+                />
+            )}
 
-            {/* Room floor */}
-            <mesh position={[0, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
-                <planeGeometry args={[w - 0.05, d - 0.05]} />
-                <meshStandardMaterial color={baseColor} opacity={0.35} transparent />
-            </mesh>
+            {/* ── Furniture ── */}
+            <Furniture roomType={roomType} w={w} d={d} />
 
-            {/* Room label */}
+            {/* ── Room label (visible when hovered or always) ── */}
             <Text
-                position={[0, wallHeight + 0.4, 0]}
-                fontSize={Math.min(0.45, w * 0.12, d * 0.12)}
-                color="#E2E8F0"
+                position={[0, wh + 0.45, 0]}
+                fontSize={Math.min(0.42, w * 0.12, d * 0.12)}
+                color={isHovered ? '#93C5FD' : '#E2E8F0'}
                 anchorX="center"
                 anchorY="bottom"
                 outlineWidth={0.02}
@@ -110,78 +353,92 @@ function Room({ bbox, roomType, label, plotWidth = 10, plotHeight = 10, isHovere
                 {displayName}
             </Text>
 
-            {/* Area label */}
-            <Text
-                position={[0, wallHeight + 0.1, 0]}
-                fontSize={Math.min(0.3, w * 0.09, d * 0.09)}
-                color="#94A3B8"
-                anchorX="center"
-                anchorY="bottom"
-                outlineWidth={0.015}
-                outlineColor="#0F172A"
-            >
-                {area.toFixed(1)} m²
-            </Text>
+            {isHovered && (
+                <Text
+                    position={[0, wh + 0.12, 0]}
+                    fontSize={Math.min(0.28, w * 0.09, d * 0.09)}
+                    color="#94A3B8"
+                    anchorX="center"
+                    anchorY="bottom"
+                    outlineWidth={0.015}
+                    outlineColor="#0F172A"
+                >
+                    {(w * d).toFixed(1)} m²
+                </Text>
+            )}
         </group>
     );
 }
 
-// ─── Ground plane with grid ───────────────────────────────────
-function Ground({ plotWidth = 10, plotHeight = 10 }) {
+// ─── Door Opening Marker ────────────────────────────────────────
+function Door({ dx, dy, plotWidth, plotHeight }) {
+    const x = (dx - 0.5) * plotWidth;
+    const z = (dy - 0.5) * plotHeight;
+    const dH = 2.1;
+
+    return (
+        <group position={[x, 0, z]}>
+            {/* Door frame */}
+            <mesh position={[0, dH / 2, 0]} castShadow>
+                <boxGeometry args={[0.95, dH, 0.18]} />
+                <meshStandardMaterial color="#78350F" roughness={0.7} />
+            </mesh>
+            {/* Door leaf (half-open) */}
+            <mesh
+                position={[0.45, dH / 2, 0.38]}
+                rotation={[0, Math.PI / 4, 0]}
+                castShadow
+            >
+                <boxGeometry args={[0.04, dH - 0.1, 0.85]} />
+                <meshStandardMaterial color="#A16207" roughness={0.65} />
+            </mesh>
+            {/* Threshold strip */}
+            <mesh position={[0, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <planeGeometry args={[0.95, 0.18]} />
+                <meshStandardMaterial color="#D97706" roughness={0.9} />
+            </mesh>
+        </group>
+    );
+}
+
+// ─── Ground Plane ───────────────────────────────────────────────
+function Ground({ plotWidth, plotHeight }) {
     return (
         <group>
-            {/* Main ground */}
-            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.01, 0]} receiveShadow>
-                <planeGeometry args={[plotWidth + 2, plotHeight + 2]} />
-                <meshStandardMaterial color="#1E293B" />
+            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.02, 0]} receiveShadow>
+                <planeGeometry args={[plotWidth + 8, plotHeight + 8]} />
+                <meshStandardMaterial color="#0F172A" roughness={0.9} />
             </mesh>
-
-            {/* Grid lines */}
             <gridHelper
-                args={[Math.max(plotWidth, plotHeight) + 2, Math.max(plotWidth, plotHeight) + 2, '#334155', '#1E293B']}
+                args={[Math.max(plotWidth, plotHeight) + 8, 20, '#1E3A5F', '#1E293B']}
                 position={[0, 0, 0]}
             />
-
-            {/* Plot boundary outline */}
-            <lineSegments position={[0, 0.02, 0]}>
-                <edgesGeometry
-                    args={[new THREE.PlaneGeometry(plotWidth, plotHeight)]}
-                />
+            {/* Plot boundary */}
+            <lineSegments position={[0, 0.03, 0]}>
+                <edgesGeometry args={[new THREE.PlaneGeometry(plotWidth, plotHeight)]} />
                 <lineBasicMaterial color="#3B82F6" linewidth={2} />
             </lineSegments>
         </group>
     );
 }
 
-// ─── Compass Arrow ────────────────────────────────────────────
-function CompassArrow({ facing, plotWidth = 10, plotHeight = 10 }) {
-    const pos = useMemo(() => {
-        const offset = Math.max(plotWidth, plotHeight) / 2 + 1.5;
-        return [0, 0.1, -offset];
-    }, [plotWidth, plotHeight]);
-
+// ─── Compass ────────────────────────────────────────────────────
+function CompassArrow({ plotWidth, plotHeight }) {
+    const offset = Math.max(plotWidth, plotHeight) / 2 + 2.0;
     return (
-        <group position={pos}>
+        <group position={[0, 0.1, -offset]}>
             <mesh rotation={[-Math.PI / 2, 0, 0]}>
-                <coneGeometry args={[0.3, 0.8, 4]} />
-                <meshStandardMaterial color="#EF4444" />
+                <coneGeometry args={[0.35, 1.0, 4]} />
+                <meshStandardMaterial color="#EF4444" roughness={0.6} />
             </mesh>
-            <Text
-                position={[0, 0.6, 0]}
-                fontSize={0.4}
-                color="#EF4444"
-                anchorX="center"
-                anchorY="bottom"
-                outlineWidth={0.02}
-                outlineColor="#0F172A"
-            >
+            <Text position={[0, 0.8, 0]} fontSize={0.5} color="#EF4444" anchorX="center" anchorY="bottom" outlineWidth={0.02} outlineColor="#0F172A">
                 N
             </Text>
         </group>
     );
 }
 
-// ─── Main Component ───────────────────────────────────────────
+// ─── Main Export ────────────────────────────────────────────────
 export default function ThreePreview() {
     const layout = useLayoutStore((s) => s.layout);
     const [hoveredIdx, setHoveredIdx] = useState(null);
@@ -208,44 +465,49 @@ export default function ThreePreview() {
         <div className="w-full h-full bg-surface-900 relative">
             <Canvas
                 shadows
-                camera={{ position: [plotWidth * 0.8, plotWidth * 0.6, plotWidth * 0.8], fov: 50 }}
-                gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 1.2 }}
+                camera={{ position: [plotWidth * 0.9, plotWidth * 0.7, plotWidth * 0.9], fov: 48 }}
+                gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 1.3 }}
             >
-                {/* Lighting */}
-                <ambientLight intensity={0.4} />
+                {/* ── Sky ── */}
+                <Sky sunPosition={[100, 80, 100]} turbidity={4} rayleigh={0.5} />
+
+                {/* ── Lighting ── */}
+                <ambientLight intensity={0.5} color="#E0E8FF" />
                 <directionalLight
-                    position={[plotWidth, plotWidth * 1.5, plotWidth]}
-                    intensity={0.9}
+                    position={[plotWidth * 1.5, plotWidth * 2, plotWidth]}
+                    intensity={1.2}
                     castShadow
                     shadow-mapSize-width={2048}
                     shadow-mapSize-height={2048}
-                    shadow-camera-far={50}
-                    shadow-camera-left={-15}
-                    shadow-camera-right={15}
-                    shadow-camera-top={15}
-                    shadow-camera-bottom={-15}
+                    shadow-camera-far={60}
+                    shadow-camera-left={-20}
+                    shadow-camera-right={20}
+                    shadow-camera-top={20}
+                    shadow-camera-bottom={-20}
+                    shadow-bias={-0.0005}
                 />
-                <directionalLight position={[-5, 8, -5]} intensity={0.3} />
+                <directionalLight position={[-plotWidth, plotWidth, -plotWidth]} intensity={0.4} color="#A5B4FC" />
+                <pointLight position={[0, 4, 0]} intensity={0.6} distance={20} color="#FEF3C7" />
 
-                {/* Environment */}
-                <fog attach="fog" args={['#0F172A', 20, 60]} />
+                {/* ── Environment / fog ── */}
+                <fog attach="fog" args={['#0F172A', 25, 70]} />
 
-                {/* Ground */}
+                {/* ── Ground ── */}
                 <Ground plotWidth={plotWidth} plotHeight={plotHeight} />
 
-                {/* Compass */}
-                <CompassArrow facing={layout.facing} plotWidth={plotWidth} plotHeight={plotHeight} />
+                {/* ── Compass ── */}
+                <CompassArrow plotWidth={plotWidth} plotHeight={plotHeight} />
 
-                {/* Contact shadows for depth */}
+                {/* ── Contact Shadows ── */}
                 <ContactShadows
-                    position={[0, 0, 0]}
-                    opacity={0.4}
-                    scale={plotWidth * 2}
-                    blur={2}
-                    far={10}
+                    position={[0, 0.02, 0]}
+                    opacity={0.55}
+                    scale={plotWidth * 2.5}
+                    blur={2.5}
+                    far={12}
                 />
 
-                {/* Room boxes */}
+                {/* ── Room Boxes ── */}
                 {layout.rooms.map((room, i) => (
                     <Room
                         key={room.room_spec?.room_id || `room-${i}`}
@@ -259,18 +521,31 @@ export default function ThreePreview() {
                     />
                 ))}
 
-                {/* Controls */}
+                {/* ── Doors ── */}
+                {layout.rooms.flatMap((room) =>
+                    (room.door_midpoints || []).map(([dx, dy], i) => (
+                        <Door
+                            key={`door-${room.room_spec?.room_id}-${i}`}
+                            dx={dx}
+                            dy={dy}
+                            plotWidth={plotWidth}
+                            plotHeight={plotHeight}
+                        />
+                    ))
+                )}
+
+                {/* ── Controls ── */}
                 <OrbitControls
                     enableDamping
                     dampingFactor={0.08}
                     maxPolarAngle={Math.PI / 2.1}
                     minDistance={3}
-                    maxDistance={plotWidth * 4}
+                    maxDistance={plotWidth * 5}
                     target={[0, 1, 0]}
                 />
             </Canvas>
 
-            {/* Hovered room info overlay */}
+            {/* Hovered Room Overlay */}
             {hoveredIdx !== null && layout.rooms[hoveredIdx] && (
                 <div className="absolute top-3 left-3 bg-surface-800/90 backdrop-blur-sm border border-surface-700 rounded-lg px-3 py-2 pointer-events-none">
                     <p className="text-xs text-blueprint-400 font-semibold">
@@ -282,10 +557,10 @@ export default function ThreePreview() {
                 </div>
             )}
 
-            {/* 3D mode badge */}
+            {/* 3D Indicator badge */}
             <div className="absolute bottom-3 left-3 flex items-center gap-1.5 bg-surface-800/80 backdrop-blur-sm border border-surface-700 rounded-full px-2.5 py-1">
                 <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                <span className="text-[10px] text-surface-400 font-medium">3D View</span>
+                <span className="text-[10px] text-surface-400 font-medium">3D View • Enhanced</span>
             </div>
         </div>
     );

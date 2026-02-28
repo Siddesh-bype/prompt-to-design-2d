@@ -19,8 +19,8 @@ class Settings(BaseSettings):
     # --- Claude API (primary) ---
     anthropic_api_key: str = ""
     claude_model: str = "claude-haiku-4-5-20251001"
-    claude_max_tokens: int = 2048
-    claude_timeout: int = 30
+    claude_max_tokens: int = 4096
+    claude_timeout: int = 45
 
     # --- OpenRouter (backup) ---
     openrouter_api_key: str = ""

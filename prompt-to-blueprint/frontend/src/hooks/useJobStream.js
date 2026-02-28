@@ -18,7 +18,14 @@ export default function useJobStream() {
 
     const wsRef = useRef(null);
     const retriesRef = useRef(0);
+    const statusRef = useRef('idle');
     const maxRetries = 3;
+
+    // Helper to sync ref and state
+    const updateStatus = useCallback((newStatus) => {
+        setStatus(newStatus);
+        statusRef.current = newStatus;
+    }, []);
 
     // Cleanup on unmount
     useEffect(() => {
@@ -37,7 +44,7 @@ export default function useJobStream() {
         }
 
         retriesRef.current = 0;
-        setStatus('queued');
+        updateStatus('queued');
         setProgress(0);
         setError(null);
 
@@ -55,7 +62,7 @@ export default function useJobStream() {
                 try {
                     const data = JSON.parse(event.data);
 
-                    if (data.status) setStatus(data.status);
+                    if (data.status) updateStatus(data.status);
                     if (data.progress_pct !== undefined) setProgress(data.progress_pct);
 
                     if (data.status === 'error') {
@@ -83,7 +90,7 @@ export default function useJobStream() {
                 if (
                     !event.wasClean &&
                     retriesRef.current < maxRetries &&
-                    !['complete', 'error'].includes(status)
+                    !['complete', 'error'].includes(statusRef.current)
                 ) {
                     retriesRef.current += 1;
                     const delay = Math.min(1000 * Math.pow(2, retriesRef.current), 8000);
@@ -100,10 +107,10 @@ export default function useJobStream() {
             wsRef.current.close();
             wsRef.current = null;
         }
-        setStatus('idle');
+        updateStatus('idle');
         setProgress(0);
         setError(null);
-    }, []);
+    }, [updateStatus]);
 
     return {
         status,

@@ -83,6 +83,8 @@ class AdjacencyEdge(BaseModel):
 
 class ParsedLayout(BaseModel):
     """Output of the NLP parser — structured floor plan specification."""
+    thinking_: Optional[str] = Field(None, alias="thinking_")
+    verification_: Optional[str] = Field(None, alias="verification_")
     rooms: list[RoomSpec] = Field(
         ..., min_length=2, max_length=30,
         description="List of room specifications (2–30 rooms)"
@@ -157,6 +159,9 @@ class LayoutGraph(BaseModel):
     )
     facing: CompassFacing = Field(
         ..., description="Primary compass facing"
+    )
+    vastu_enabled: bool = Field(
+        False, description="Whether Vastu Shastra compliance was requested"
     )
     generation_mode: Literal["gnn", "heuristic"] = Field(
         "gnn", description="Which generation method was used"

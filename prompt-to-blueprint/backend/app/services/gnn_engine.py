@@ -425,6 +425,7 @@ def run_gnn_inference(
         adjacency_edges=parsed_layout.adjacency_constraints,
         plot_area_sqm=parsed_layout.plot_area_sqm,
         facing=parsed_layout.facing,
+        vastu_enabled=parsed_layout.vastu_enabled,
         generation_mode="gnn",
     )
 

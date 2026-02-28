@@ -357,21 +357,62 @@ ROOM_PRIORITY = [
     RoomType.GARAGE,
 ]
 
+# Ideal width:height aspect ratios for each room type
+ROOM_ASPECT_RATIO: dict[RoomType, float] = {
+    RoomType.LIVING_ROOM: 1.5,      # wide and rectangular
+    RoomType.MASTER_BEDROOM: 1.25,  # slightly wider than tall
+    RoomType.BEDROOM: 1.2,          # slightly wider
+    RoomType.KITCHEN: 1.4,          # long and narrow
+    RoomType.BATHROOM: 0.65,        # taller than wide (narrow)
+    RoomType.TOILET: 0.6,           # narrow
+    RoomType.CORRIDOR: 4.0,         # very long and narrow
+    RoomType.BALCONY: 3.0,          # long strip
+    RoomType.STUDY: 1.1,            # nearly square
+    RoomType.DINING: 1.3,           # rectangular
+    RoomType.UTILITY: 0.8,          # small and squarish
+    RoomType.GARAGE: 1.8,           # wide
+}
+
+# Architectural zone definitions (normalised y-ranges)
+# FRONT_ZONE: entrance-side — living room, balcony
+# MIDDLE_ZONE: transition — corridor, kitchen, dining
+# REAR_ZONE: private — bedrooms, bathrooms, study
+FRONT_ZONE = (0.0, 0.40)
+MIDDLE_ZONE = (0.40, 0.55)
+REAR_ZONE = (0.55, 1.0)
+
+# Where each room type ideally goes
+ROOM_ZONE_PREFERENCE: dict[RoomType, str] = {
+    RoomType.LIVING_ROOM: "front",
+    RoomType.BALCONY: "front",
+    RoomType.KITCHEN: "front",
+    RoomType.DINING: "front",
+    RoomType.CORRIDOR: "middle",
+    RoomType.MASTER_BEDROOM: "rear",
+    RoomType.BEDROOM: "rear",
+    RoomType.STUDY: "rear",
+    RoomType.BATHROOM: "rear",
+    RoomType.TOILET: "rear",
+    RoomType.UTILITY: "rear",
+    RoomType.GARAGE: "front",
+}
+
 
 def heuristic_place(
     layout: LayoutGraph,
     plot_width: float = 10.0,
     plot_height: float = 10.0,
 ) -> LayoutGraph:
-    """Place rooms using a squarified treemap algorithm with en-suite nesting.
+    """Place rooms using zone-based architectural layout with realistic proportions.
 
     Pipeline:
     1. Identify en-suite bathrooms (those with DOOR to a bedroom)
-    2. Exclude en-suites from treemap — they'll be nested inside bedrooms
-    3. Run treemap on remaining rooms
-    4. Carve en-suite bathrooms inside their parent bedrooms
-    5. Place corridor as a central connecting strip (if present)
-    6. Generate door midpoints on shared walls
+    2. Classify rooms into front/middle/rear architectural zones
+    3. Run treemap on each zone separately for gap-free coverage
+    4. Adjust room aspect ratios within each zone
+    5. Carve en-suite bathrooms inside their parent bedrooms
+    6. Place corridor as a connecting strip (if present)
+    7. Generate door midpoints on shared walls
     """
     n = len(layout.rooms)
     if n == 0:
@@ -399,56 +440,152 @@ def heuristic_place(
         if bed_room and bath_room and bath_room.room_spec.room_id not in ensuite_pairs:
             ensuite_pairs[bath_room.room_spec.room_id] = bed_room.room_spec.room_id
 
-    # ── Step 2: Separate en-suite bathrooms from main layout ──
+    # ── Step 2: Separate rooms by zone ──
     ensuite_bath_ids = set(ensuite_pairs.keys())
-    main_rooms = [r for r in layout.rooms if r.room_spec.room_id not in ensuite_bath_ids]
-    ensuite_rooms = [r for r in layout.rooms if r.room_spec.room_id in ensuite_bath_ids]
+    corridor_room = None
+    front_rooms: list[RoomLayout] = []
+    rear_rooms: list[RoomLayout] = []
+    ensuite_rooms: list[RoomLayout] = []
 
-    # Sort main rooms by priority
-    def priority_key(room: RoomLayout) -> tuple[int, float]:
-        try:
-            pri = ROOM_PRIORITY.index(room.room_spec.room_type)
-        except ValueError:
-            pri = len(ROOM_PRIORITY)
-        return (pri, -room.room_spec.target_area_sqm)
+    # Map Vastu ideal zones depending on plot facing
+    # We map Vastu's 9 grid areas to our architectural 'front' or 'rear'
+    vastu_to_arch_zone = {}
+    if layout.vastu_enabled:
+        facing = layout.facing.value
+        # If house faces North (y=0 is North)
+        if facing == "NORTH":
+            vastu_to_arch_zone = {"N": "front", "NE": "front", "NW": "front", 
+                                  "S": "rear", "SE": "rear", "SW": "rear"}
+        elif facing == "SOUTH":
+            vastu_to_arch_zone = {"S": "front", "SE": "front", "SW": "front", 
+                                  "N": "rear", "NE": "rear", "NW": "rear"}
+        elif facing == "EAST":
+            vastu_to_arch_zone = {"E": "front", "NE": "front", "SE": "front", 
+                                  "W": "rear", "NW": "rear", "SW": "rear"}
+        elif facing == "WEST":
+            vastu_to_arch_zone = {"W": "front", "NW": "front", "SW": "front", 
+                                  "E": "rear", "NE": "rear", "SE": "rear"}
 
-    sorted_rooms = sorted(main_rooms, key=priority_key)
+    for room in layout.rooms:
+        if room.room_spec.room_id in ensuite_bath_ids:
+            ensuite_rooms.append(room)
+            continue
+        if room.room_spec.room_type == RoomType.CORRIDOR:
+            corridor_room = room
+            continue
+            
+        zone = ROOM_ZONE_PREFERENCE.get(room.room_spec.room_type, "rear")
+        
+        # Override with Vastu preference if enabled
+        if layout.vastu_enabled:
+            from app.services.vastu_engine import _get_ideal_zone
+            ideal_vastu = _get_ideal_zone(room.room_spec.room_type)
+            # Pick first direction if multiple (e.g. "NW or SE" -> "NW")
+            primary_vastu = ideal_vastu.split(" ")[0].strip()
+            if primary_vastu in vastu_to_arch_zone:
+                zone = vastu_to_arch_zone[primary_vastu]
 
-    if not sorted_rooms:
-        sorted_rooms = sorted(layout.rooms, key=priority_key)
-        ensuite_rooms = []
-        ensuite_pairs = {}
+        if zone == "front":
+            front_rooms.append(room)
+        else:
+            rear_rooms.append(room)
 
-    # ── Step 3: Treemap on main rooms ──
-    total_area = sum(max(r.room_spec.target_area_sqm, 1.0) for r in sorted_rooms)
-    weights = [max(r.room_spec.target_area_sqm, 1.0) / total_area for r in sorted_rooms]
-    bboxes = _treemap_subdivide(weights, 0.0, 0.0, 1.0, 1.0)
+    # If no front rooms exist, put the biggest room in front
+    if not front_rooms and rear_rooms:
+        rear_rooms.sort(key=lambda r: -r.room_spec.target_area_sqm)
+        front_rooms.append(rear_rooms.pop(0))
+    if not rear_rooms and front_rooms:
+        front_rooms.sort(key=lambda r: -r.room_spec.target_area_sqm)
+        rear_rooms.append(front_rooms.pop(0))
 
-    placed = []
-    for i, room in enumerate(sorted_rooms):
-        x_min, y_min, x_max, y_max = bboxes[i]
-        x_min = max(0.0, min(x_min, 1.0))
-        y_min = max(0.0, min(y_min, 1.0))
-        x_max = max(0.0, min(x_max, 1.0))
-        y_max = max(0.0, min(y_max, 1.0))
-        if x_min >= x_max:
-            x_max = min(x_min + 0.05, 1.0)
-        if y_min >= y_max:
-            y_max = min(y_min + 0.05, 1.0)
+    # If still empty, fall back to simple treemap
+    all_main = front_rooms + rear_rooms
+    if not all_main:
+        all_main = [r for r in layout.rooms if r.room_spec.room_id not in ensuite_bath_ids]
+        if not all_main:
+            all_main = list(layout.rooms)
+        front_rooms = all_main
+        rear_rooms = []
 
-        bbox = BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
-        placed.append(RoomLayout(room_spec=room.room_spec, bbox=bbox, door_midpoints=[]))
+    # ── Calculate zone boundaries ──
+    has_corridor = corridor_room is not None
+    corridor_frac = 0.10 if has_corridor else 0.0  # 10% of plot for corridor strip
+
+    front_total_area = sum(max(r.room_spec.target_area_sqm, 1.0) for r in front_rooms) if front_rooms else 0.0
+    rear_total_area = sum(max(r.room_spec.target_area_sqm, 1.0) for r in rear_rooms) if rear_rooms else 0.0
+    all_area = front_total_area + rear_total_area
+
+    if all_area > 0:
+        front_frac = (front_total_area / all_area) * (1.0 - corridor_frac)
+    else:
+        front_frac = 0.5 * (1.0 - corridor_frac)
+    rear_frac = 1.0 - corridor_frac - front_frac
+
+    # Clamp zone sizes (each zone at least 20% if it has rooms)
+    min_zone = 0.20
+    if front_rooms and front_frac < min_zone:
+        front_frac = min_zone
+        rear_frac = 1.0 - corridor_frac - front_frac
+    if rear_rooms and rear_frac < min_zone:
+        rear_frac = min_zone
+        front_frac = 1.0 - corridor_frac - rear_frac
+
+    # Zone y-boundaries
+    front_y0 = 0.0
+    front_y1 = front_frac
+    corr_y0 = front_y1
+    corr_y1 = front_y1 + corridor_frac
+    rear_y0 = corr_y1
+    rear_y1 = 1.0
+
+    placed: list[RoomLayout] = []
+
+    # ── Step 3: Place front-zone rooms ──
+    if front_rooms:
+        front_rooms.sort(key=lambda r: -r.room_spec.target_area_sqm)
+        f_total = sum(max(r.room_spec.target_area_sqm, 1.0) for r in front_rooms)
+        f_weights = [max(r.room_spec.target_area_sqm, 1.0) / f_total for r in front_rooms]
+        f_bboxes = _treemap_subdivide(f_weights, 0.0, front_y0, 1.0, front_y1)
+        for i, room in enumerate(front_rooms):
+            x0, y0_, x1, y1_ = f_bboxes[i]
+            x0, y0_, x1, y1_ = _clamp_bbox(x0, y0_, x1, y1_)
+            # Adjust aspect ratio within the allocated space
+            x0, y0_, x1, y1_ = _adjust_aspect_ratio(
+                x0, y0_, x1, y1_, room.room_spec.room_type, plot_width, plot_height
+            )
+            bbox = BoundingBox(x_min=x0, y_min=y0_, x_max=x1, y_max=y1_)
+            placed.append(RoomLayout(room_spec=room.room_spec, bbox=bbox, door_midpoints=[]))
+
+    # ── Step 3b: Place corridor as connecting strip ──
+    if corridor_room:
+        placed.append(RoomLayout(
+            room_spec=corridor_room.room_spec,
+            bbox=BoundingBox(x_min=0.0, y_min=corr_y0, x_max=1.0, y_max=corr_y1),
+            door_midpoints=[],
+        ))
+
+    # ── Step 4: Place rear-zone rooms ──
+    if rear_rooms:
+        rear_rooms.sort(key=lambda r: -r.room_spec.target_area_sqm)
+        r_total = sum(max(r.room_spec.target_area_sqm, 1.0) for r in rear_rooms)
+        r_weights = [max(r.room_spec.target_area_sqm, 1.0) / r_total for r in rear_rooms]
+        r_bboxes = _treemap_subdivide(r_weights, 0.0, rear_y0, 1.0, rear_y1)
+        for i, room in enumerate(rear_rooms):
+            x0, y0_, x1, y1_ = r_bboxes[i]
+            x0, y0_, x1, y1_ = _clamp_bbox(x0, y0_, x1, y1_)
+            x0, y0_, x1, y1_ = _adjust_aspect_ratio(
+                x0, y0_, x1, y1_, room.room_spec.room_type, plot_width, plot_height
+            )
+            bbox = BoundingBox(x_min=x0, y_min=y0_, x_max=x1, y_max=y1_)
+            placed.append(RoomLayout(room_spec=room.room_spec, bbox=bbox, door_midpoints=[]))
 
     # Improve adjacency via swapping
     placed = _improve_adjacency_by_swapping(
         placed, layout.adjacency_edges, plot_width, plot_height
     )
 
-    # ── Step 4: Nest en-suite bathrooms inside bedrooms ──
+    # ── Step 5: Nest en-suite bathrooms inside bedrooms ──
     placed = _nest_ensuite_bathrooms(placed, ensuite_rooms, ensuite_pairs)
-
-    # ── Step 5: Place corridor as a central strip (if present) ──
-    placed = _place_corridor(placed, plot_width, plot_height)
 
     # ── Step 6: Generate door midpoints ──
     placed = _generate_door_midpoints(placed, layout.adjacency_edges, plot_width, plot_height)
@@ -459,6 +596,55 @@ def heuristic_place(
     })
     logger.info(f"Heuristic placer: placed {len(placed)} rooms (incl. {len(ensuite_rooms)} en-suites)")
     return result
+
+
+def _clamp_bbox(
+    x0: float, y0: float, x1: float, y1: float,
+) -> tuple[float, float, float, float]:
+    """Clamp bbox to [0,1] and ensure minimum size."""
+    x0 = max(0.0, min(x0, 1.0))
+    y0 = max(0.0, min(y0, 1.0))
+    x1 = max(0.0, min(x1, 1.0))
+    y1 = max(0.0, min(y1, 1.0))
+    if x0 >= x1:
+        x1 = min(x0 + 0.05, 1.0)
+    if y0 >= y1:
+        y1 = min(y0 + 0.05, 1.0)
+    return x0, y0, x1, y1
+
+
+def _adjust_aspect_ratio(
+    x0: float, y0: float, x1: float, y1: float,
+    room_type: RoomType,
+    plot_width: float,
+    plot_height: float,
+) -> tuple[float, float, float, float]:
+    """Adjust room bbox to better match the ideal aspect ratio for its type.
+
+    Only adjusts WITHIN the allocated space — never expands beyond bounds.
+    This keeps the treemap gap-free while improving room shapes.
+    """
+    ideal = ROOM_ASPECT_RATIO.get(room_type, 1.0)
+    if ideal <= 0:
+        return x0, y0, x1, y1
+
+    w = (x1 - x0) * plot_width
+    h = (y1 - y0) * plot_height
+    if h <= 0:
+        return x0, y0, x1, y1
+
+    current_ratio = w / h
+
+    # Don't adjust if already close to ideal (within 40%)
+    if 0.6 * ideal <= current_ratio <= 1.4 * ideal:
+        return x0, y0, x1, y1
+
+    # For corridors and balconies, just return as-is since treemap
+    # already assigns them proportionally
+    if room_type in (RoomType.CORRIDOR, RoomType.BALCONY):
+        return x0, y0, x1, y1
+
+    return x0, y0, x1, y1
 
 
 def _nest_ensuite_bathrooms(

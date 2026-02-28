@@ -100,12 +100,16 @@ class ParseValidationError(Exception):
 
 def build_system_prompt() -> str:
     """Build the system prompt that instructs the LLM to extract structured data."""
-    return """You are a specialised architectural floor plan parser. Your ONLY job is to extract structured information from a natural language description of a home/apartment and output VALID JSON.
+    return """You are a specialised architectural floor plan parser. Your job is to extract structured information from a natural language description of a home/apartment and output VALID JSON.
+
+To ensure high accuracy, you MUST follow a rigorous thinking and verification process before generating the final JSON layout.
 
 RULES:
 1. Output ONLY a valid JSON object. No markdown, no explanation, no prose outside the JSON.
 2. The JSON must match this exact schema:
 {
+  "thinking_": "<one concise sentence describing your analysis>",
+  "verification_": "<one concise sentence confirming all rooms connected and correct count>",
   "rooms": [
     {
       "room_id": "room_1",
@@ -154,6 +158,10 @@ ARCHITECTURAL RULES (MUST FOLLOW):
 - LIVING_ROOM connects to KITCHEN via OPENING.
 - KITCHEN connects to DINING (if present) via OPENING.
 
+10. EN-SUITE BATHROOMS: If a prompt says "bedroom with attached bathroom", you MUST add a DOOR connection between that specific BEDROOM and that specific BATHROOM. Double check this in your `verification_` step.
+11. CONNECTIVITY: Never leave a room floating. Ensure every room is connected to a Hallway/Corridor or Living Room.
+12. THINKING STEP: Use the `thinking_` and `verification_` fields to write out your logic before outputting the structural arrays. This improves your accuracy.
+
 DEFAULTS:
 - If no plot area mentioned, use 100.0 sqm
 - If no facing mentioned, use NORTH
@@ -166,32 +174,70 @@ DEFAULTS:
 
 
 def _extract_json(content: str) -> dict:
-    """Extract a JSON object from an LLM response string."""
-    json_str = content.strip()
+    """Extract a JSON object from an LLM response string.
+    
+    Uses a brace-balanced scanner so nested objects inside strings
+    don't trip up the extraction.
+    """
+    text = content.strip()
 
-    # Remove markdown code fences
-    if json_str.startswith("```"):
-        lines = json_str.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        json_str = "\n".join(lines)
+    # 1. Remove markdown code fences (```json ... ``` or ``` ... ```)
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
 
+    # 2. Try direct parse first (fastest path — LLM did what it was told)
     try:
-        return json.loads(json_str)
+        return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try to find a JSON object in the response
-    match = re.search(r"\{.*\}", json_str, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+    # 3. Brace-balanced scanner: find the largest valid JSON object
+    start = text.find('{')
+    if start == -1:
+        raise ParseValidationError(
+            "Failed to extract JSON from LLM response — no '{' found",
+            details={"raw_content": content[:600]},
+        )
 
-    raise ParseValidationError(
-        "Failed to extract JSON from LLM response",
-        details={"raw_content": content[:500]},
-    )
+    depth = 0
+    in_str = False
+    escape = False
+    end = -1
+    for i, ch in enumerate(text[start:], start=start):
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+
+    if end == -1:
+        raise ParseValidationError(
+            "Failed to extract JSON from LLM response — unbalanced braces",
+            details={"raw_content": content[:600]},
+        )
+
+    candidate = text[start:end + 1]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as e:
+        raise ParseValidationError(
+            f"Failed to parse extracted JSON: {e}",
+            details={"raw_content": candidate[:600]},
+        )
 
 
 # ─── Claude API Call ─────────────────────────────────────────────────────────
@@ -212,19 +258,23 @@ def call_claude(prompt: str, system: str, model: str | None = None) -> dict:
             model=model,
             max_tokens=settings.claude_max_tokens,
             system=system,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            messages=[
+                {"role": "user", "content": prompt},
+                # Prefill forces Claude to start with `{` — guarantees JSON-only output
+                {"role": "assistant", "content": "{"},
+            ],
+            temperature=0.0,
         )
 
-        content = ""
+        content = "{"
         for block in message.content:
             if block.type == "text":
                 content += block.text
 
-        if not content:
+        if not content.strip():
             raise ClaudeConnectionError("Claude returned an empty response")
 
-        logger.debug(f"Claude raw response: {content[:200]}...")
+        logger.debug(f"Claude raw response (first 300 chars): {content[:300]}")
         return _extract_json(content)
 
     except ImportError:
@@ -250,16 +300,20 @@ async def acall_claude(prompt: str, system: str, model: str | None = None) -> di
             model=model,
             max_tokens=settings.claude_max_tokens,
             system=system,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            messages=[
+                {"role": "user", "content": prompt},
+                # Prefill forces Claude to start with `{` — guarantees JSON-only output
+                {"role": "assistant", "content": "{"},
+            ],
+            temperature=0.0,
         )
 
-        content = ""
+        content = "{"
         for block in message.content:
             if block.type == "text":
                 content += block.text
 
-        if not content:
+        if not content.strip():
             raise ClaudeConnectionError("Claude returned an empty response")
 
         return _extract_json(content)
@@ -814,6 +868,7 @@ def _enforce_layout_rules(raw_json: dict, bedroom_count: int) -> dict:
 
     # ── RULE: Corridor connects to all major rooms (not bathrooms) ──
     corridor_id = first_room_id(RoomType.CORRIDOR)
+    living_id = first_room_id(RoomType.LIVING_ROOM)
     if corridor_id:
         corridor_connectable_types = {
             RoomType.LIVING_ROOM.value, RoomType.KITCHEN.value,
@@ -832,6 +887,25 @@ def _enforce_layout_rules(raw_json: dict, bedroom_count: int) -> dict:
                         "required": True,
                     })
 
+    # ── RULE: Connectivity Guarantee ──
+    # Ensure every room has at least one edge (to prevent isolated floating rooms).
+    # We connect isolated rooms to a 'hub' (Corridor, or Living Room, or the first room)
+    hub_id = corridor_id or living_id or (rooms[0]["room_id"] if rooms else None)
+    if hub_id:
+        for r in rooms:
+            if r["room_id"] == hub_id:
+                continue
+            # Check if this room is part of any edge
+            has_edge = any(e["room_a_id"] == r["room_id"] or e["room_b_id"] == r["room_id"] for e in edges)
+            if not has_edge:
+                # Force a connection
+                edges.append({
+                    "room_a_id": hub_id,
+                    "room_b_id": r["room_id"],
+                    "connection_type": "DOOR",
+                    "required": True,
+                })
+
     # Plot area sanity
     total_area = sum(float(r["target_area_sqm"]) for r in rooms) if rooms else 0.0
     plot = fixed.get("plot_area_sqm")
@@ -841,6 +915,9 @@ def _enforce_layout_rules(raw_json: dict, bedroom_count: int) -> dict:
     plot = max(float(plot), min_plot)
     plot = min(plot, 2000.0)
 
+    # Scale room areas proportionally to plot size
+    rooms = _scale_areas_to_plot(rooms, plot)
+
     fixed["rooms"] = rooms
     fixed["adjacency_constraints"] = edges
     fixed["plot_area_sqm"] = round(plot, 1)
@@ -849,6 +926,43 @@ def _enforce_layout_rules(raw_json: dict, bedroom_count: int) -> dict:
         fixed["style_hints"] = []
 
     return fixed
+
+
+def _scale_areas_to_plot(rooms: list[dict], plot_sqm: float) -> list[dict]:
+    """Scale room areas proportionally so they fill ~85-92% of the plot.
+
+    This ensures rooms are right-sized for both small and large plots.
+    Default room areas in ROOM_DEFAULT_AREA assume a ~100 sqm plot.
+    """
+    if not rooms or plot_sqm <= 0:
+        return rooms
+
+    total_room_area = sum(float(r.get("target_area_sqm", 10.0)) for r in rooms)
+    if total_room_area <= 0:
+        return rooms
+
+    # Target: rooms should fill 88% of the plot (rest is walls)
+    target_total = plot_sqm * 0.88
+    scale = target_total / total_room_area
+
+    # Only scale if significantly off (>15% difference)
+    if 0.85 <= scale <= 1.15:
+        return rooms
+
+    # Clamp scale factor to avoid extreme sizing
+    scale = max(0.5, min(scale, 3.0))
+
+    result = []
+    for r in rooms:
+        r_copy = dict(r)
+        area = float(r_copy.get("target_area_sqm", 10.0))
+        scaled = area * scale
+        # Enforce min/max per room
+        scaled = max(3.0, min(scaled, 200.0))
+        r_copy["target_area_sqm"] = round(scaled, 1)
+        result.append(r_copy)
+
+    return result
 
 
 # ─── Main Entrypoints ───────────────────────────────────────────────────────

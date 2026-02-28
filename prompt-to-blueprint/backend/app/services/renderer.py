@@ -2,7 +2,8 @@
 Renderer — SVG and DXF export service for floor plan layouts.
 
 Converts a LayoutGraph into visual outputs:
-- SVG: in-browser rendering with room colours, labels, dimensions, doors
+- SVG: in-browser rendering with professional blueprint aesthetics,
+       furniture symbols, wall thickness, doors, windows, dimensions
 - DXF: CAD-compatible format using ezdxf
 """
 
@@ -40,24 +41,30 @@ except ImportError:
     HAS_SHAPELY = False
 
 
-# ─── Room Colour Palette ────────────────────────────────────────────────────
+# ─── Room Colour Palette (elegant, professional colours) ────────────────────
 
 ROOM_COLOURS: dict[RoomType, str] = {
-    RoomType.LIVING_ROOM: "#E8F4FD",
-    RoomType.KITCHEN: "#FFF9E6",
-    RoomType.MASTER_BEDROOM: "#F0F4FF",
-    RoomType.BEDROOM: "#F5F0FF",
-    RoomType.BATHROOM: "#E6F9F5",
-    RoomType.TOILET: "#E6F9F5",
-    RoomType.CORRIDOR: "#F5F5F5",
-    RoomType.BALCONY: "#E8F8E8",
-    RoomType.STUDY: "#FFF0E8",
-    RoomType.DINING: "#FFF5F0",
-    RoomType.UTILITY: "#F0F0F0",
-    RoomType.GARAGE: "#EDEDED",
+    RoomType.LIVING_ROOM: "#DCEEFB",
+    RoomType.KITCHEN: "#FFF3D6",
+    RoomType.MASTER_BEDROOM: "#E0E4F5",
+    RoomType.BEDROOM: "#E8E0F5",
+    RoomType.BATHROOM: "#D6F5EE",
+    RoomType.TOILET: "#D6F5EE",
+    RoomType.CORRIDOR: "#EDEDED",
+    RoomType.BALCONY: "#D9F2D9",
+    RoomType.STUDY: "#FFECD6",
+    RoomType.DINING: "#FFE8E0",
+    RoomType.UTILITY: "#E8E8E8",
+    RoomType.GARAGE: "#E0E0E0",
 }
 
-DEFAULT_COLOUR = "#FAFAFA"
+DEFAULT_COLOUR = "#F5F5F5"
+
+# Wall rendering constants
+WALL_THICKNESS_PX = 4      # main walls
+INNER_WALL_PX = 2.5        # inner partition walls
+DOOR_WIDTH_PX = 18          # door swing arc radius
+WINDOW_WIDTH_PX = 16        # window marker width
 
 
 # ─── FUNCTION 1: SVG Rendering ──────────────────────────────────────────────
@@ -70,26 +77,24 @@ def layout_to_svg(
     show_dimensions: bool = True,
     show_room_labels: bool = True,
 ) -> str:
-    """Convert a LayoutGraph into an SVG string.
+    """Convert a LayoutGraph into a professional architectural SVG string.
 
-    Args:
-        layout: The layout graph to render
-        canvas_width_px: Canvas width in pixels
-        canvas_height_px: Canvas height in pixels
-        show_dimensions: Whether to show dimension lines
-        show_room_labels: Whether to show room labels
-
-    Returns:
-        Complete SVG as a UTF-8 string
+    Renders with:
+    - Thick outer walls, thinner inner partition walls
+    - Furniture symbols inside rooms
+    - Door swing arcs at door positions
+    - Window markers on exterior walls
+    - Dimension annotations
+    - Compass rose and title block
     """
     # Calculate plot dimensions
     plot_area = layout.plot_area_sqm
-    aspect = 1.0  # Assume square plot
+    aspect = 1.0
     plot_w = math.sqrt(plot_area * aspect)
     plot_h = plot_area / plot_w
 
-    # Padding
-    pad = 30
+    # Padding for dimension annotations
+    pad = 50
     draw_w = canvas_width_px - 2 * pad
     draw_h = canvas_height_px - 2 * pad
 
@@ -99,54 +104,88 @@ def layout_to_svg(
         "viewBox": f"0 0 {canvas_width_px} {canvas_height_px}",
         "width": str(canvas_width_px),
         "height": str(canvas_height_px),
-        "style": "background: #FFFFFF; font-family: Arial, sans-serif;",
+        "style": "background: #FFFFFF; font-family: 'Segoe UI', Arial, sans-serif;",
     })
 
-    # Defs (patterns/gradients)
+    # ─── Defs ───
     defs = ET.SubElement(svg, "defs")
 
     # Shadow filter
-    shadow_filter = ET.SubElement(defs, "filter", {"id": "shadow", "x": "-2%", "y": "-2%", "width": "104%", "height": "104%"})
+    shadow_filter = ET.SubElement(defs, "filter", {
+        "id": "room-shadow", "x": "-1%", "y": "-1%", "width": "102%", "height": "102%",
+    })
     ET.SubElement(shadow_filter, "feDropShadow", {
-        "dx": "1", "dy": "1", "stdDeviation": "2", "flood-opacity": "0.1",
+        "dx": "0.5", "dy": "0.5", "stdDeviation": "1.5", "flood-opacity": "0.08",
     })
 
-    # Corridor hatching pattern
-    hatch_pattern = ET.SubElement(defs, "pattern", {
-        "id": "corridor-hatch",
-        "patternUnits": "userSpaceOnUse",
-        "width": "8", "height": "8",
-        "patternTransform": "rotate(45)",
+    # Corridor hatching
+    hatch = ET.SubElement(defs, "pattern", {
+        "id": "corridor-hatch", "patternUnits": "userSpaceOnUse",
+        "width": "6", "height": "6", "patternTransform": "rotate(45)",
     })
-    ET.SubElement(hatch_pattern, "line", {
-        "x1": "0", "y1": "0", "x2": "0", "y2": "8",
-        "stroke": "#CBD5E1", "stroke-width": "1.5",
+    ET.SubElement(hatch, "line", {
+        "x1": "0", "y1": "0", "x2": "0", "y2": "6",
+        "stroke": "#C0C8D4", "stroke-width": "1",
     })
 
-    # Background
+    # Bathroom tile pattern
+    tile = ET.SubElement(defs, "pattern", {
+        "id": "bath-tile", "patternUnits": "userSpaceOnUse",
+        "width": "10", "height": "10",
+    })
+    ET.SubElement(tile, "rect", {
+        "width": "10", "height": "10", "fill": "#D6F5EE",
+    })
+    ET.SubElement(tile, "path", {
+        "d": "M 0 10 L 10 0 M -1 1 L 1 -1 M 9 11 L 11 9",
+        "stroke": "#B0DDD0", "stroke-width": "0.5",
+    })
+
+    # ─── Background ───
     ET.SubElement(svg, "rect", {
         "x": "0", "y": "0",
         "width": str(canvas_width_px), "height": str(canvas_height_px),
-        "fill": "#FAFBFC",
+        "fill": "#FDFEFF",
     })
 
-    # Plot border
+    # ─── Title Block ───
+    title = ET.SubElement(svg, "text", {
+        "x": str(pad), "y": "22",
+        "font-size": "13", "font-weight": "700",
+        "fill": "#1A2740", "font-family": "'Segoe UI', Arial, sans-serif",
+        "letter-spacing": "0.5",
+    })
+    title.text = f"FLOOR PLAN — {plot_area:.0f} m² | {layout.facing.value}-FACING"
+
+    # Subtitle with metrics
+    subtitle = ET.SubElement(svg, "text", {
+        "x": str(pad), "y": "38",
+        "font-size": "9", "fill": "#7B8DA0",
+        "font-family": "'Segoe UI', Arial, sans-serif",
+    })
+    subtitle.text = (
+        f"Plot: {plot_w:.1f}m × {plot_h:.1f}m | "
+        f"Rooms: {len(layout.rooms)} | "
+        f"Mode: {layout.generation_mode}"
+    )
+
+    # ─── Plot boundary (thick outer wall) ───
     ET.SubElement(svg, "rect", {
         "x": str(pad), "y": str(pad),
         "width": str(draw_w), "height": str(draw_h),
         "fill": "none",
-        "stroke": "#0D1F3C",
-        "stroke-width": "3",
-        "rx": "2",
+        "stroke": "#1A2740",
+        "stroke-width": str(WALL_THICKNESS_PX + 1),
+        "rx": "1",
     })
 
-    # Compass indicator
-    _add_compass(svg, canvas_width_px - 50, 50, layout.facing.value)
-
-    # Track door midpoints already drawn (avoid duplicates)
+    # Track door midpoints already drawn
     drawn_doors: set[tuple[int, int]] = set()
 
-    # Room rectangles
+    # Collect room pixel data for window/furniture placement
+    room_pixel_data: list[dict] = []
+
+    # ─── Room Fills ───
     for room in layout.rooms:
         bbox = room.bbox
         x = pad + bbox.x_min * draw_w
@@ -156,18 +195,26 @@ def layout_to_svg(
 
         fill = ROOM_COLOURS.get(room.room_spec.room_type, DEFAULT_COLOUR)
         is_corridor = room.room_spec.room_type == RoomType.CORRIDOR
+        is_bathroom = room.room_spec.room_type in (RoomType.BATHROOM, RoomType.TOILET)
 
-        # Room rectangle
+        rpd = {
+            "x": x, "y": y, "w": w, "h": h,
+            "room": room, "fill": fill,
+            "room_w_m": (bbox.x_max - bbox.x_min) * plot_w,
+            "room_h_m": (bbox.y_max - bbox.y_min) * plot_h,
+        }
+        room_pixel_data.append(rpd)
+
+        # Room fill
+        fill_attr = "url(#bath-tile)" if is_bathroom else fill
         ET.SubElement(svg, "rect", {
             "x": f"{x:.1f}", "y": f"{y:.1f}",
             "width": f"{w:.1f}", "height": f"{h:.1f}",
-            "fill": fill,
-            "stroke": "#334155",
-            "stroke-width": "2",
-            "rx": "2",
+            "fill": fill_attr,
+            "stroke": "none",
             "data-room-type": room.room_spec.room_type.value,
             "data-room-id": room.room_spec.room_id,
-            "filter": "url(#shadow)",
+            "filter": "url(#room-shadow)",
         })
 
         # Corridor hatching overlay
@@ -176,138 +223,92 @@ def layout_to_svg(
                 "x": f"{x:.1f}", "y": f"{y:.1f}",
                 "width": f"{w:.1f}", "height": f"{h:.1f}",
                 "fill": "url(#corridor-hatch)",
-                "stroke": "none",
-                "opacity": "0.4",
+                "stroke": "none", "opacity": "0.3",
             })
 
-        # Room label
-        if show_room_labels:
+    # ─── Inner partition walls ───
+    for rpd in room_pixel_data:
+        x, y, w, h = rpd["x"], rpd["y"], rpd["w"], rpd["h"]
+        ET.SubElement(svg, "rect", {
+            "x": f"{x:.1f}", "y": f"{y:.1f}",
+            "width": f"{w:.1f}", "height": f"{h:.1f}",
+            "fill": "none",
+            "stroke": "#3A4A5C",
+            "stroke-width": str(INNER_WALL_PX),
+        })
+
+    # ─── Furniture Symbols ───
+    for rpd in room_pixel_data:
+        _draw_furniture(svg, rpd)
+
+    # ─── Room Labels ───
+    if show_room_labels:
+        for rpd in room_pixel_data:
+            room = rpd["room"]
+            x, y, w, h = rpd["x"], rpd["y"], rpd["w"], rpd["h"]
             display_name = room.room_spec.room_type.value.replace("_", " ").title()
-            room_area_m2 = bbox.area * plot_area
-            label_text = f"{display_name}"
-            area_text = f"{room_area_m2:.1f} m²"
+            room_area_m2 = room.bbox.area * plot_area
 
             cx = x + w / 2
             cy = y + h / 2
 
-            # Adjust font size based on room size
-            font_size = min(11, max(7, min(w, h) / 6))
+            font_size = min(11, max(7, min(w, h) / 5.5))
 
+            # Room name
             name_elem = ET.SubElement(svg, "text", {
-                "x": f"{cx:.1f}", "y": f"{cy - 6:.1f}",
+                "x": f"{cx:.1f}", "y": f"{cy - 5:.1f}",
                 "text-anchor": "middle",
                 "dominant-baseline": "middle",
-                "font-family": "Arial, sans-serif",
-                "font-size": f"{font_size}",
+                "font-size": f"{font_size:.1f}",
                 "font-weight": "600",
                 "fill": "#1E293B",
+                "font-family": "'Segoe UI', Arial, sans-serif",
             })
-            name_elem.text = label_text
+            name_elem.text = display_name
 
+            # Area (smaller, lighter)
             area_elem = ET.SubElement(svg, "text", {
                 "x": f"{cx:.1f}", "y": f"{cy + 8:.1f}",
                 "text-anchor": "middle",
                 "dominant-baseline": "middle",
-                "font-family": "Arial, sans-serif",
-                "font-size": f"{max(font_size - 2, 7)}",
+                "font-size": f"{max(font_size - 2, 6.5):.1f}",
                 "fill": "#64748B",
+                "font-family": "'Segoe UI', Arial, sans-serif",
             })
-            area_elem.text = area_text
+            area_elem.text = f"{room_area_m2:.1f} m²"
 
-        # Dimension lines
-        if show_dimensions:
-            room_w_m = (bbox.x_max - bbox.x_min) * plot_w
-            room_h_m = (bbox.y_max - bbox.y_min) * plot_h
+    # ─── Dimension Lines ───
+    if show_dimensions:
+        for rpd in room_pixel_data:
+            _draw_dimensions(svg, rpd)
 
-            # Bottom dimension
-            dim_y = y + h + 12
-            ET.SubElement(svg, "line", {
-                "x1": f"{x:.1f}", "y1": f"{dim_y:.1f}",
-                "x2": f"{x + w:.1f}", "y2": f"{dim_y:.1f}",
-                "stroke": "#94A3B8", "stroke-width": "1",
-            })
-            dim_text = ET.SubElement(svg, "text", {
-                "x": f"{x + w/2:.1f}", "y": f"{dim_y + 10:.1f}",
-                "text-anchor": "middle",
-                "font-size": "8", "fill": "#94A3B8",
-                "font-family": "Arial, sans-serif",
-            })
-            dim_text.text = f"{room_w_m:.1f}m"
-
-            # Right dimension
-            dim_x = x + w + 8
-            dim_text_r = ET.SubElement(svg, "text", {
-                "x": f"{dim_x:.1f}", "y": f"{y + h/2:.1f}",
-                "text-anchor": "start",
-                "dominant-baseline": "middle",
-                "font-size": "8", "fill": "#94A3B8",
-                "font-family": "Arial, sans-serif",
-                "transform": f"rotate(90 {dim_x:.1f} {y + h/2:.1f})",
-            })
-            dim_text_r.text = f"{room_h_m:.1f}m"
-
-        # Door arc markers
+    # ─── Door Arcs ───
+    for rpd in room_pixel_data:
+        room = rpd["room"]
+        bbox = room.bbox
         for dx, dy in room.door_midpoints:
             door_x = pad + dx * draw_w
             door_y = pad + dy * draw_h
 
-            # Deduplicate: doors are shared between two rooms
             key = (round(door_x * 10), round(door_y * 10))
             if key in drawn_doors:
                 continue
             drawn_doors.add(key)
 
-            # Draw an architectural door arc (quarter circle + door line)
-            arc_r = 6  # radius in pixels
+            _draw_door_arc(svg, door_x, door_y, dx, dy, bbox)
 
-            # Determine door orientation based on position relative to room
-            on_vertical_wall = (abs(dx - bbox.x_min) < 0.01 or abs(dx - bbox.x_max) < 0.01)
+    # ─── Window Markers on Exterior Walls ───
+    for rpd in room_pixel_data:
+        _draw_exterior_windows(svg, rpd, pad, draw_w, draw_h)
 
-            if on_vertical_wall:
-                # Door on vertical wall: arc sweeps horizontally
-                arc_path = (
-                    f"M {door_x:.1f} {door_y - arc_r:.1f} "
-                    f"A {arc_r} {arc_r} 0 0 1 {door_x + arc_r:.1f} {door_y:.1f}"
-                )
-                ET.SubElement(svg, "line", {
-                    "x1": f"{door_x:.1f}", "y1": f"{door_y - arc_r:.1f}",
-                    "x2": f"{door_x:.1f}", "y2": f"{door_y + arc_r:.1f}",
-                    "stroke": "#2196F3", "stroke-width": "2",
-                })
-            else:
-                # Door on horizontal wall: arc sweeps vertically
-                arc_path = (
-                    f"M {door_x - arc_r:.1f} {door_y:.1f} "
-                    f"A {arc_r} {arc_r} 0 0 1 {door_x:.1f} {door_y - arc_r:.1f}"
-                )
-                ET.SubElement(svg, "line", {
-                    "x1": f"{door_x - arc_r:.1f}", "y1": f"{door_y:.1f}",
-                    "x2": f"{door_x + arc_r:.1f}", "y2": f"{door_y:.1f}",
-                    "stroke": "#2196F3", "stroke-width": "2",
-                })
+    # ─── Compass Rose ───
+    _add_compass(svg, canvas_width_px - 50, 50, layout.facing.value)
 
-            # Draw the arc
-            ET.SubElement(svg, "path", {
-                "d": arc_path,
-                "fill": "none",
-                "stroke": "#2196F3",
-                "stroke-width": "1.5",
-                "stroke-dasharray": "3,2",
-            })
-
-    # Title
-    title = ET.SubElement(svg, "text", {
-        "x": str(pad), "y": "18",
-        "font-size": "12", "font-weight": "bold",
-        "fill": "#1E293B", "font-family": "Arial, sans-serif",
-    })
-    title.text = f"Floor Plan — {plot_area:.0f} m² | {layout.facing.value}-facing"
-
-    # Metrics
+    # ─── Footer Metrics ───
     metrics = ET.SubElement(svg, "text", {
         "x": str(pad), "y": str(canvas_height_px - 8),
-        "font-size": "9", "fill": "#94A3B8",
-        "font-family": "Arial, sans-serif",
+        "font-size": "8", "fill": "#94A3B8",
+        "font-family": "'Segoe UI', Arial, sans-serif",
     })
     metrics.text = (
         f"Overlap: {layout.overlap_rate:.1%} | "
@@ -318,34 +319,550 @@ def layout_to_svg(
     return ET.tostring(svg, encoding="unicode", xml_declaration=False)
 
 
+# ─── Furniture Drawing Helpers ──────────────────────────────────────────────
+
+
+def _draw_furniture(parent: ET.Element, rpd: dict) -> None:
+    """Draw room-appropriate furniture symbols."""
+    room = rpd["room"]
+    x, y, w, h = rpd["x"], rpd["y"], rpd["w"], rpd["h"]
+    rt = room.room_spec.room_type
+    stroke = "#8B9DB5"
+    stroke_w = "0.8"
+
+    if w < 30 or h < 30:
+        return  # too small for furniture
+
+    if rt == RoomType.LIVING_ROOM:
+        _draw_sofa(parent, x, y, w, h, stroke, stroke_w)
+    elif rt in (RoomType.BEDROOM, RoomType.MASTER_BEDROOM):
+        _draw_bed(parent, x, y, w, h, stroke, stroke_w, is_master=(rt == RoomType.MASTER_BEDROOM))
+    elif rt == RoomType.KITCHEN:
+        _draw_kitchen(parent, x, y, w, h, stroke, stroke_w)
+    elif rt == RoomType.BATHROOM:
+        _draw_bathroom(parent, x, y, w, h, stroke, stroke_w)
+    elif rt == RoomType.TOILET:
+        _draw_toilet(parent, x, y, w, h, stroke, stroke_w)
+    elif rt == RoomType.DINING:
+        _draw_dining(parent, x, y, w, h, stroke, stroke_w)
+    elif rt == RoomType.STUDY:
+        _draw_study(parent, x, y, w, h, stroke, stroke_w)
+    elif rt == RoomType.BALCONY:
+        _draw_balcony(parent, x, y, w, h, stroke, stroke_w)
+
+
+def _draw_sofa(parent, x, y, w, h, stroke, stroke_w):
+    """Sofa + coffee table in living room."""
+    # Sofa (bottom area)
+    sw = min(w * 0.55, 60)
+    sh = min(h * 0.18, 14)
+    sx = x + w * 0.5 - sw / 2
+    sy = y + h * 0.72
+
+    ET.SubElement(parent, "rect", {
+        "x": f"{sx:.1f}", "y": f"{sy:.1f}",
+        "width": f"{sw:.1f}", "height": f"{sh:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": stroke_w,
+        "rx": "2",
+    })
+    # Backrest
+    ET.SubElement(parent, "rect", {
+        "x": f"{sx:.1f}", "y": f"{sy + sh:.1f}",
+        "width": f"{sw:.1f}", "height": f"{sh * 0.4:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": stroke_w,
+        "rx": "1",
+    })
+
+    # Coffee table
+    tw = sw * 0.45
+    th = sh * 0.6
+    tx = x + w * 0.5 - tw / 2
+    ty = sy - th - 8
+    ET.SubElement(parent, "rect", {
+        "x": f"{tx:.1f}", "y": f"{ty:.1f}",
+        "width": f"{tw:.1f}", "height": f"{th:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": stroke_w,
+        "rx": "1",
+    })
+
+
+def _draw_bed(parent, x, y, w, h, stroke, stroke_w, is_master=False):
+    """Bed with headboard and pillows."""
+    # Bed rectangle (centred, occupying ~60% of room)
+    bw = min(w * 0.55, 55 if is_master else 45)
+    bh = min(h * 0.50, 50 if is_master else 40)
+    bx = x + w * 0.5 - bw / 2
+    by = y + h * 0.5 - bh / 2
+
+    # Bed frame
+    ET.SubElement(parent, "rect", {
+        "x": f"{bx:.1f}", "y": f"{by:.1f}",
+        "width": f"{bw:.1f}", "height": f"{bh:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": stroke_w,
+        "rx": "1",
+    })
+
+    # Headboard (top bar)
+    ET.SubElement(parent, "rect", {
+        "x": f"{bx:.1f}", "y": f"{by:.1f}",
+        "width": f"{bw:.1f}", "height": f"{3:.1f}",
+        "fill": stroke, "stroke": "none", "opacity": "0.3",
+    })
+
+    # Pillows
+    pw = bw * 0.38
+    ph = bh * 0.14
+    py = by + 6
+    # Left pillow
+    ET.SubElement(parent, "rect", {
+        "x": f"{bx + 3:.1f}", "y": f"{py:.1f}",
+        "width": f"{pw:.1f}", "height": f"{ph:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": "0.6",
+        "rx": "2",
+    })
+    # Right pillow (for master or double)
+    if is_master or bw > 35:
+        ET.SubElement(parent, "rect", {
+            "x": f"{bx + bw - pw - 3:.1f}", "y": f"{py:.1f}",
+            "width": f"{pw:.1f}", "height": f"{ph:.1f}",
+            "fill": "none", "stroke": stroke, "stroke-width": "0.6",
+            "rx": "2",
+        })
+
+    # Side table
+    st_w = bw * 0.18
+    st_h = st_w
+    st_x = bx - st_w - 4
+    st_y = by + bh * 0.3
+    if st_x > x + 4:
+        ET.SubElement(parent, "rect", {
+            "x": f"{st_x:.1f}", "y": f"{st_y:.1f}",
+            "width": f"{st_w:.1f}", "height": f"{st_h:.1f}",
+            "fill": "none", "stroke": stroke, "stroke-width": "0.5",
+            "rx": "1",
+        })
+
+
+def _draw_kitchen(parent, x, y, w, h, stroke, stroke_w):
+    """Kitchen counter (L-shaped) + stove symbol."""
+    # Counter along top wall
+    cw = w * 0.85
+    ch = min(h * 0.15, 12)
+    cx = x + (w - cw) / 2
+    cy = y + 4
+
+    ET.SubElement(parent, "rect", {
+        "x": f"{cx:.1f}", "y": f"{cy:.1f}",
+        "width": f"{cw:.1f}", "height": f"{ch:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": stroke_w,
+        "rx": "1",
+    })
+
+    # L-extension (right side)
+    lw = min(w * 0.12, 10)
+    lh = min(h * 0.35, 30)
+    lx = cx + cw - lw
+    ly = cy + ch
+
+    ET.SubElement(parent, "rect", {
+        "x": f"{lx:.1f}", "y": f"{ly:.1f}",
+        "width": f"{lw:.1f}", "height": f"{lh:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": stroke_w,
+    })
+
+    # Stove burners (4 circles)
+    burner_area_x = cx + cw * 0.6
+    burner_area_y = cy + ch / 2
+    br = min(ch * 0.2, 3)
+    for dx_off, dy_off in [(-br*1.5, -br*0.6), (br*1.5, -br*0.6), (-br*1.5, br*0.6), (br*1.5, br*0.6)]:
+        ET.SubElement(parent, "circle", {
+            "cx": f"{burner_area_x + dx_off:.1f}",
+            "cy": f"{burner_area_y + dy_off:.1f}",
+            "r": f"{br:.1f}",
+            "fill": "none", "stroke": stroke, "stroke-width": "0.5",
+        })
+
+    # Sink (small rectangle)
+    sk_w = min(cw * 0.12, 10)
+    sk_h = ch * 0.6
+    sk_x = cx + cw * 0.25
+    sk_y = cy + (ch - sk_h) / 2
+    ET.SubElement(parent, "rect", {
+        "x": f"{sk_x:.1f}", "y": f"{sk_y:.1f}",
+        "width": f"{sk_w:.1f}", "height": f"{sk_h:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": "0.5",
+        "rx": "1",
+    })
+
+
+def _draw_bathroom(parent, x, y, w, h, stroke, stroke_w):
+    """Shower tray + toilet + sink."""
+    # Shower tray (top-right corner)
+    sw = min(w * 0.4, 25)
+    sh = min(h * 0.35, 25)
+    sx = x + w - sw - 4
+    sy = y + 4
+    ET.SubElement(parent, "rect", {
+        "x": f"{sx:.1f}", "y": f"{sy:.1f}",
+        "width": f"{sw:.1f}", "height": f"{sh:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": stroke_w,
+        "stroke-dasharray": "3,2",
+    })
+    # Shower head dot
+    ET.SubElement(parent, "circle", {
+        "cx": f"{sx + sw / 2:.1f}", "cy": f"{sy + sh / 2:.1f}",
+        "r": "2",
+        "fill": "none", "stroke": stroke, "stroke-width": "0.5",
+    })
+
+    # Toilet (bottom-left)
+    _draw_toilet_symbol(parent, x + 8, y + h - 22, min(w * 0.3, 16), 18, stroke)
+
+    # Sink (top-left)
+    sk_w = min(w * 0.22, 12)
+    sk_h = min(h * 0.12, 8)
+    ET.SubElement(parent, "ellipse", {
+        "cx": f"{x + 10 + sk_w / 2:.1f}", "cy": f"{y + sh + 12:.1f}",
+        "rx": f"{sk_w / 2:.1f}", "ry": f"{sk_h / 2:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": "0.6",
+    })
+
+
+def _draw_toilet(parent, x, y, w, h, stroke, stroke_w):
+    """Toilet + wash basin."""
+    tw = min(w * 0.35, 16)
+    th = min(h * 0.4, 20)
+    tx = x + w / 2 - tw / 2
+    ty = y + h * 0.55
+    _draw_toilet_symbol(parent, tx, ty, tw, th, stroke)
+
+    # Wash basin
+    sk_w = min(w * 0.3, 14)
+    sk_h = min(h * 0.12, 8)
+    ET.SubElement(parent, "ellipse", {
+        "cx": f"{x + w / 2:.1f}", "cy": f"{y + h * 0.25:.1f}",
+        "rx": f"{sk_w / 2:.1f}", "ry": f"{sk_h / 2:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": "0.6",
+    })
+
+
+def _draw_toilet_symbol(parent, x, y, w, h, stroke):
+    """Draw a toilet bowl plan-view symbol."""
+    # Tank
+    ET.SubElement(parent, "rect", {
+        "x": f"{x:.1f}", "y": f"{y + h * 0.7:.1f}",
+        "width": f"{w:.1f}", "height": f"{h * 0.3:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": "0.6",
+        "rx": "1",
+    })
+    # Bowl
+    ET.SubElement(parent, "ellipse", {
+        "cx": f"{x + w / 2:.1f}", "cy": f"{y + h * 0.35:.1f}",
+        "rx": f"{w / 2:.1f}", "ry": f"{h * 0.4:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": "0.6",
+    })
+
+
+def _draw_dining(parent, x, y, w, h, stroke, stroke_w):
+    """Dining table with chairs."""
+    # Table
+    tw = min(w * 0.45, 40)
+    th = min(h * 0.35, 30)
+    tx = x + w / 2 - tw / 2
+    ty = y + h / 2 - th / 2
+    ET.SubElement(parent, "rect", {
+        "x": f"{tx:.1f}", "y": f"{ty:.1f}",
+        "width": f"{tw:.1f}", "height": f"{th:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": stroke_w,
+        "rx": "2",
+    })
+
+    # Chairs (small semicircles on each side)
+    chair_r = min(tw * 0.12, 4)
+    positions = [
+        (tx + tw * 0.3, ty - chair_r - 1),       # top
+        (tx + tw * 0.7, ty - chair_r - 1),
+        (tx + tw * 0.3, ty + th + 1),             # bottom
+        (tx + tw * 0.7, ty + th + 1),
+        (tx - chair_r - 1, ty + th * 0.5),        # left
+        (tx + tw + 1, ty + th * 0.5),             # right
+    ]
+    for cx, cy in positions:
+        if cx > x + 2 and cx < x + w - 2 and cy > y + 2 and cy < y + h - 2:
+            ET.SubElement(parent, "circle", {
+                "cx": f"{cx:.1f}", "cy": f"{cy:.1f}",
+                "r": f"{chair_r:.1f}",
+                "fill": "none", "stroke": stroke, "stroke-width": "0.5",
+            })
+
+
+def _draw_study(parent, x, y, w, h, stroke, stroke_w):
+    """Desk with chair."""
+    # Desk
+    dw = min(w * 0.5, 35)
+    dh = min(h * 0.18, 12)
+    dx = x + w * 0.5 - dw / 2
+    dy = y + h * 0.3
+    ET.SubElement(parent, "rect", {
+        "x": f"{dx:.1f}", "y": f"{dy:.1f}",
+        "width": f"{dw:.1f}", "height": f"{dh:.1f}",
+        "fill": "none", "stroke": stroke, "stroke-width": stroke_w,
+        "rx": "1",
+    })
+
+    # Chair (circle below desk)
+    ET.SubElement(parent, "circle", {
+        "cx": f"{dx + dw / 2:.1f}", "cy": f"{dy + dh + 8:.1f}",
+        "r": "4",
+        "fill": "none", "stroke": stroke, "stroke-width": "0.5",
+    })
+
+
+def _draw_balcony(parent, x, y, w, h, stroke, stroke_w):
+    """Railing lines on balcony."""
+    # Railing (parallel lines near the outside edge)
+    rail_y = y + h - 4
+    for i in range(2):
+        ET.SubElement(parent, "line", {
+            "x1": f"{x + 4:.1f}", "y1": f"{rail_y - i * 3:.1f}",
+            "x2": f"{x + w - 4:.1f}", "y2": f"{rail_y - i * 3:.1f}",
+            "stroke": stroke, "stroke-width": "0.7",
+        })
+
+    # Vertical railing supports
+    n_supports = max(3, int(w / 15))
+    spacing = (w - 8) / max(n_supports - 1, 1)
+    for i in range(n_supports):
+        sx = x + 4 + i * spacing
+        ET.SubElement(parent, "line", {
+            "x1": f"{sx:.1f}", "y1": f"{rail_y:.1f}",
+            "x2": f"{sx:.1f}", "y2": f"{rail_y - 3:.1f}",
+            "stroke": stroke, "stroke-width": "0.5",
+        })
+
+
+# ─── Dimension Lines ────────────────────────────────────────────────────────
+
+
+def _draw_dimensions(parent: ET.Element, rpd: dict) -> None:
+    """Draw dimension annotations with tick marks."""
+    x, y, w, h = rpd["x"], rpd["y"], rpd["w"], rpd["h"]
+    room_w_m = rpd["room_w_m"]
+    room_h_m = rpd["room_h_m"]
+    dim_color = "#8B9DB5"
+
+    if w < 25 or h < 25:
+        return
+
+    # Bottom dimension line
+    dim_y = y + h + 10
+    # Tick marks
+    for tx in [x, x + w]:
+        ET.SubElement(parent, "line", {
+            "x1": f"{tx:.1f}", "y1": f"{dim_y - 3:.1f}",
+            "x2": f"{tx:.1f}", "y2": f"{dim_y + 3:.1f}",
+            "stroke": dim_color, "stroke-width": "0.8",
+        })
+    # Line
+    ET.SubElement(parent, "line", {
+        "x1": f"{x:.1f}", "y1": f"{dim_y:.1f}",
+        "x2": f"{x + w:.1f}", "y2": f"{dim_y:.1f}",
+        "stroke": dim_color, "stroke-width": "0.6",
+    })
+    # Label
+    dim_text = ET.SubElement(parent, "text", {
+        "x": f"{x + w / 2:.1f}", "y": f"{dim_y + 10:.1f}",
+        "text-anchor": "middle",
+        "font-size": "7", "fill": dim_color,
+        "font-family": "'Segoe UI', Arial, sans-serif",
+    })
+    dim_text.text = f"{room_w_m:.1f}m"
+
+    # Right dimension (rotated)
+    dim_x = x + w + 8
+    for ty in [y, y + h]:
+        ET.SubElement(parent, "line", {
+            "x1": f"{dim_x - 3:.1f}", "y1": f"{ty:.1f}",
+            "x2": f"{dim_x + 3:.1f}", "y2": f"{ty:.1f}",
+            "stroke": dim_color, "stroke-width": "0.8",
+        })
+    ET.SubElement(parent, "line", {
+        "x1": f"{dim_x:.1f}", "y1": f"{y:.1f}",
+        "x2": f"{dim_x:.1f}", "y2": f"{y + h:.1f}",
+        "stroke": dim_color, "stroke-width": "0.6",
+    })
+    dim_text_r = ET.SubElement(parent, "text", {
+        "x": f"{dim_x:.1f}", "y": f"{y + h / 2:.1f}",
+        "text-anchor": "start",
+        "dominant-baseline": "middle",
+        "font-size": "7", "fill": dim_color,
+        "font-family": "'Segoe UI', Arial, sans-serif",
+        "transform": f"rotate(90 {dim_x:.1f} {y + h / 2:.1f})",
+    })
+    dim_text_r.text = f"{room_h_m:.1f}m"
+
+
+# ─── Door Arc Drawing ───────────────────────────────────────────────────────
+
+
+def _draw_door_arc(
+    parent: ET.Element,
+    door_x: float, door_y: float,
+    dx_norm: float, dy_norm: float,
+    bbox: BoundingBox,
+) -> None:
+    """Draw an architectural door swing arc."""
+    arc_r = DOOR_WIDTH_PX / 2
+    door_color = "#2563EB"
+
+    on_vertical = (abs(dx_norm - bbox.x_min) < 0.015 or abs(dx_norm - bbox.x_max) < 0.015)
+
+    if on_vertical:
+        # Door on vertical wall
+        ET.SubElement(parent, "line", {
+            "x1": f"{door_x:.1f}", "y1": f"{door_y - arc_r:.1f}",
+            "x2": f"{door_x:.1f}", "y2": f"{door_y + arc_r:.1f}",
+            "stroke": door_color, "stroke-width": "1.5",
+        })
+        arc_path = (
+            f"M {door_x:.1f} {door_y - arc_r:.1f} "
+            f"A {arc_r} {arc_r} 0 0 1 {door_x + arc_r:.1f} {door_y:.1f}"
+        )
+    else:
+        # Door on horizontal wall
+        ET.SubElement(parent, "line", {
+            "x1": f"{door_x - arc_r:.1f}", "y1": f"{door_y:.1f}",
+            "x2": f"{door_x + arc_r:.1f}", "y2": f"{door_y:.1f}",
+            "stroke": door_color, "stroke-width": "1.5",
+        })
+        arc_path = (
+            f"M {door_x - arc_r:.1f} {door_y:.1f} "
+            f"A {arc_r} {arc_r} 0 0 1 {door_x:.1f} {door_y - arc_r:.1f}"
+        )
+
+    ET.SubElement(parent, "path", {
+        "d": arc_path,
+        "fill": "none",
+        "stroke": door_color,
+        "stroke-width": "1",
+        "stroke-dasharray": "3,2",
+    })
+
+
+# ─── Window Markers on Exterior Walls ───────────────────────────────────────
+
+
+def _draw_exterior_windows(
+    parent: ET.Element, rpd: dict,
+    pad: float, draw_w: float, draw_h: float,
+) -> None:
+    """Draw window markers on walls that touch the plot boundary."""
+    room = rpd["room"]
+    bbox = room.bbox
+    x, y, w, h = rpd["x"], rpd["y"], rpd["w"], rpd["h"]
+    win_color = "#3B82F6"
+
+    # Skip corridors, utility, garage — they typically don't have windows
+    if room.room_spec.room_type in (RoomType.CORRIDOR, RoomType.UTILITY, RoomType.GARAGE, RoomType.TOILET):
+        return
+
+    win_w = min(WINDOW_WIDTH_PX, w * 0.3, h * 0.3)
+
+    # Top edge touches plot top (y_min ≈ 0)
+    if bbox.y_min < 0.02 and w > 30:
+        wx = x + w / 2 - win_w / 2
+        wy = y
+        _draw_window_mark(parent, wx, wy, win_w, True, win_color)
+
+    # Bottom edge touches plot bottom (y_max ≈ 1)
+    if bbox.y_max > 0.98 and w > 30:
+        wx = x + w / 2 - win_w / 2
+        wy = y + h
+        _draw_window_mark(parent, wx, wy, win_w, True, win_color)
+
+    # Left edge touches plot left (x_min ≈ 0)
+    if bbox.x_min < 0.02 and h > 30:
+        wx = x
+        wy = y + h / 2 - win_w / 2
+        _draw_window_mark(parent, wx, wy, win_w, False, win_color)
+
+    # Right edge touches plot right (x_max ≈ 1)
+    if bbox.x_max > 0.98 and h > 30:
+        wx = x + w
+        wy = y + h / 2 - win_w / 2
+        _draw_window_mark(parent, wx, wy, win_w, False, win_color)
+
+
+def _draw_window_mark(
+    parent: ET.Element,
+    x: float, y: float, size: float,
+    horizontal: bool, color: str,
+) -> None:
+    """Draw a window marker (three parallel lines indicating glass)."""
+    if horizontal:
+        # Window on horizontal wall
+        for i in range(3):
+            offset = (i - 1) * 2
+            ET.SubElement(parent, "line", {
+                "x1": f"{x:.1f}", "y1": f"{y + offset:.1f}",
+                "x2": f"{x + size:.1f}", "y2": f"{y + offset:.1f}",
+                "stroke": color, "stroke-width": "1",
+            })
+    else:
+        # Window on vertical wall
+        for i in range(3):
+            offset = (i - 1) * 2
+            ET.SubElement(parent, "line", {
+                "x1": f"{x + offset:.1f}", "y1": f"{y:.1f}",
+                "x2": f"{x + offset:.1f}", "y2": f"{y + size:.1f}",
+                "stroke": color, "stroke-width": "1",
+            })
+
+
+# ─── Compass Rose ───────────────────────────────────────────────────────────
+
+
 def _add_compass(
     parent: ET.Element, cx: float, cy: float, facing: str
 ) -> None:
-    """Add a small compass indicator to the SVG."""
+    """Add a compass rose indicator."""
     g = ET.SubElement(parent, "g", {
         "transform": f"translate({cx},{cy})",
     })
 
-    # Circle
+    # Outer circle
     ET.SubElement(g, "circle", {
-        "cx": "0", "cy": "0", "r": "18",
-        "fill": "#F8FAFC", "stroke": "#CBD5E1", "stroke-width": "1",
+        "cx": "0", "cy": "0", "r": "20",
+        "fill": "#F8FAFC", "stroke": "#CBD5E1", "stroke-width": "1.5",
     })
 
-    # N marker
-    n = ET.SubElement(g, "text", {
-        "x": "0", "y": "-7",
-        "text-anchor": "middle", "font-size": "10",
-        "font-weight": "bold",
-        "fill": "#EF4444" if facing == "NORTH" else "#94A3B8",
-        "font-family": "Arial",
+    # Inner circle
+    ET.SubElement(g, "circle", {
+        "cx": "0", "cy": "0", "r": "3",
+        "fill": "#CBD5E1", "stroke": "none",
     })
-    n.text = "N"
 
-    # Arrow pointing up (North)
+    # Direction markers
+    directions = [
+        ("N", 0, -9, "#DC2626" if facing == "NORTH" else "#94A3B8"),
+        ("S", 0, 13, "#DC2626" if facing == "SOUTH" else "#94A3B8"),
+        ("E", 9, 3, "#DC2626" if facing == "EAST" else "#94A3B8"),
+        ("W", -9, 3, "#DC2626" if facing == "WEST" else "#94A3B8"),
+    ]
+    for label, dx, dy, color in directions:
+        t = ET.SubElement(g, "text", {
+            "x": str(dx), "y": str(dy),
+            "text-anchor": "middle", "font-size": "9",
+            "font-weight": "bold" if label[0] == facing[0] else "normal",
+            "fill": color,
+            "font-family": "'Segoe UI', Arial",
+        })
+        t.text = label
+
+    # North arrow
     ET.SubElement(g, "polygon", {
-        "points": "0,-16 -3,-10 3,-10",
-        "fill": "#EF4444",
+        "points": "0,-18 -3,-12 3,-12",
+        "fill": "#DC2626",
     })
 
 
@@ -358,21 +875,10 @@ def layout_to_dxf(
     plot_height_m: float = 10.0,
     scale_str: str = "1:100",
 ) -> bytes:
-    """Convert a LayoutGraph into a DXF R2018 document.
-
-    Args:
-        layout: The layout graph to render
-        plot_width_m: Plot width in metres
-        plot_height_m: Plot height in metres
-        scale_str: Scale string (e.g. "1:100")
-
-    Returns:
-        DXF file as bytes
-    """
+    """Convert a LayoutGraph into a DXF R2018 document."""
     if not HAS_EZDXF:
         raise RuntimeError("ezdxf is not installed — cannot export DXF")
 
-    # Parse scale
     scale_parts = scale_str.split(":")
     try:
         scale_factor = int(scale_parts[1]) if len(scale_parts) == 2 else 100
@@ -382,14 +888,12 @@ def layout_to_dxf(
     doc = ezdxf.new("R2018")
     msp = doc.modelspace()
 
-    # Create layers
     doc.layers.add("WALLS", color=7)
     doc.layers.add("DOORS", color=3)
     doc.layers.add("DIMENSIONS", color=2)
     doc.layers.add("ANNOTATIONS", color=1)
     doc.layers.add("PLOT_BOUNDARY", color=5)
 
-    # Plot boundary
     bx = plot_width_m * scale_factor
     by = plot_height_m * scale_factor
     msp.add_lwpolyline(
@@ -397,7 +901,6 @@ def layout_to_dxf(
         dxfattribs={"layer": "PLOT_BOUNDARY"},
     )
 
-    # Rooms
     for room in layout.rooms:
         bbox = room.bbox
         x1 = bbox.x_min * plot_width_m * scale_factor
@@ -405,11 +908,9 @@ def layout_to_dxf(
         x2 = bbox.x_max * plot_width_m * scale_factor
         y2 = bbox.y_max * plot_height_m * scale_factor
 
-        # Wall lines
         walls = [(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)]
         msp.add_lwpolyline(walls, dxfattribs={"layer": "WALLS"})
 
-        # Annotation at centroid
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         room_area = (bbox.x_max - bbox.x_min) * plot_width_m * \
@@ -421,7 +922,6 @@ def layout_to_dxf(
             dxfattribs={"layer": "ANNOTATIONS", "insert": (cx, cy)},
         )
 
-        # Door arcs
         for dx, dy in room.door_midpoints:
             door_x = dx * plot_width_m * scale_factor
             door_y = dy * plot_height_m * scale_factor
@@ -431,7 +931,6 @@ def layout_to_dxf(
                 dxfattribs={"layer": "DOORS"},
             )
 
-    # Write to bytes (ezdxf writes text content, so we encode it explicitly)
     text_stream = io.StringIO()
     doc.write(text_stream)
     return text_stream.getvalue().encode("utf-8")
@@ -441,14 +940,7 @@ def layout_to_dxf(
 
 
 def compute_overlap_rate(layout: LayoutGraph) -> float:
-    """Compute total overlapping area / total floor area using Shapely.
-
-    Args:
-        layout: The layout graph
-
-    Returns:
-        Float between 0.0 and 1.0
-    """
+    """Compute total overlapping area / total floor area using Shapely."""
     if not layout.rooms:
         return 0.0
 
@@ -473,7 +965,6 @@ def compute_overlap_rate(layout: LayoutGraph) -> float:
 
         return min(overlap_area / total_area, 1.0)
     else:
-        # Fallback: manual calculation
         total_area = 0.0
         total_overlap = 0.0
         rooms = layout.rooms
@@ -500,22 +991,12 @@ def compute_overlap_rate(layout: LayoutGraph) -> float:
 
 
 def compute_adjacency_satisfaction(layout: LayoutGraph) -> float:
-    """Check fraction of required adjacency edges that are satisfied.
-
-    Two rooms are "adjacent" if their polygons share a boundary
-    of length >= 0.9m. In normalised units for a 10m plot, that's 0.09.
-
-    Args:
-        layout: The layout graph
-
-    Returns:
-        Fraction between 0.0 and 1.0
-    """
+    """Check fraction of required adjacency edges that are satisfied."""
     required_edges = [e for e in layout.adjacency_edges if e.required]
     if not required_edges:
         return 1.0
 
-    threshold = 0.09  # 0.9m / 10m = 0.09 normalised
+    threshold = 0.09
 
     room_map = {r.room_spec.room_id: r.bbox for r in layout.rooms}
     satisfied = 0
@@ -534,13 +1015,10 @@ def compute_adjacency_satisfaction(layout: LayoutGraph) -> float:
             if shared.length >= threshold:
                 satisfied += 1
         else:
-            # Manual check
             shared_len = 0.0
-            # X-axis adjacency
             if abs(ba.x_max - bb.x_min) < 0.01 or abs(bb.x_max - ba.x_min) < 0.01:
                 y_overlap = max(0, min(ba.y_max, bb.y_max) - max(ba.y_min, bb.y_min))
                 shared_len = max(shared_len, y_overlap)
-            # Y-axis adjacency
             if abs(ba.y_max - bb.y_min) < 0.01 or abs(bb.y_max - ba.y_min) < 0.01:
                 x_overlap = max(0, min(ba.x_max, bb.x_max) - max(ba.x_min, bb.x_min))
                 shared_len = max(shared_len, x_overlap)
